@@ -1,0 +1,45 @@
+[tool.poetry]
+name = "rrbuild"
+version = "0.1.0"
+description = "Android's build scripts for rr."
+authors = ["The Android Open Source Project"]
+license = "Apache-2.0"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+
+[tool.poetry.group.dev.dependencies]
+pylint = "^2.17.0"
+black = "^23.1.0"
+isort = "^5.12.0"
+mypy = "^1.1.1"
+
+[tool.mypy]
+check_untyped_defs = true
+disallow_any_generics = true
+disallow_any_unimported = true
+disallow_subclassing_any = true
+disallow_untyped_decorators = true
+disallow_untyped_defs = true
+follow_imports = "silent"
+implicit_reexport = false
+namespace_packages = true
+no_implicit_optional = true
+show_error_codes = true
+strict_equality = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unreachable = true
+warn_unused_configs = true
+warn_unused_ignores = true
+
+[tool.pylint."MESSAGES CONTROL"]
+# Disable refactoring messages like "too many arguments".
+disable = "R"
+
+[tool.isort]
+profile = "black"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
