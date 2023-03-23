@@ -1,0 +1,17 @@
+name: "rr"
+description:
+    "Record and Replay Framework"
+
+third_party {
+  url {
+    type: HOMEPAGE
+    value: "https://rr-project.org/"
+  }
+  url {
+    type: GIT
+    value: "https://github.com/rr-debugger/rr"
+  }
+  version: "e5149f53a1268de7fc8ba47b606b081605d6b6cc"
+  last_upgrade_date { year: 2023 month: 3 day: 23 }
+  license_type: NOTICE
+}
