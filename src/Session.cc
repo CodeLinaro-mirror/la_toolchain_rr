@@ -47,6 +47,7 @@ Session::Session()
       tracee_socket_fd_number(0),
       next_task_serial_(1),
       rrcall_base_(RR_CALL_BASE),
+      syscallbuf_fds_disabled_size_(SYSCALLBUF_FDS_DISABLED_SIZE),
       syscall_seccomp_ordering_(PTRACE_SYSCALL_BEFORE_SECCOMP_UNKNOWN),
       ticks_semantics_(PerfCounters::default_ticks_semantics()),
       done_initial_exec_(false),
@@ -68,6 +69,7 @@ Session::Session(const Session& other) {
   next_task_serial_ = other.next_task_serial_;
   done_initial_exec_ = other.done_initial_exec_;
   rrcall_base_ = other.rrcall_base_;
+  syscallbuf_fds_disabled_size_ = other.syscallbuf_fds_disabled_size_;
   visible_execution_ = other.visible_execution_;
   tracee_socket = other.tracee_socket;
   tracee_socket_receiver = other.tracee_socket_receiver;
@@ -576,7 +578,7 @@ const AddressSpace::Mapping& Session::steal_mapping(
   // We will include the name of the full path of the original mapping in the
   // name of the shared mapping, replacing slashes by dashes.
   char name[PATH_MAX - 40];
-  strncpy(name, m.map.fsname().c_str(), sizeof(name));
+  strncpy(name, m.map.fsname().c_str(), sizeof(name)-1);
   name[sizeof(name) - 1] = '\0';
   for (char* ptr = name; *ptr != '\0'; ++ptr) {
     if (*ptr == '/') {

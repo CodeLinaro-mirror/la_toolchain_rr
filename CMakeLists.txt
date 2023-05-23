@@ -37,6 +37,10 @@ set(rr_VERSION_MAJOR 5)
 set(rr_VERSION_MINOR 6)
 set(rr_VERSION_PATCH 0)
 
+if(ANDROID)
+  find_package(CapnProto REQUIRED)
+endif()
+
 add_definitions(-DRR_VERSION="${rr_VERSION_MAJOR}.${rr_VERSION_MINOR}.${rr_VERSION_PATCH}")
 
 execute_process(
@@ -552,6 +556,7 @@ set(RR_SOURCES
   src/kernel_metadata.cc
   src/log.cc
   src/LsCommand.cc
+  src/main.cc
   src/MagicSaveDataMonitor.cc
   src/MmappedFileMonitor.cc
   src/MonitoredSharedMemory.cc
@@ -604,6 +609,13 @@ if (x86ish)
   set(RR_SOURCES ${RR_SOURCES} src/test/x86/cpuid_loop.S)
 endif()
 
+option(asan "Build with address sanitizer enabled.")
+if (asan)
+  set(ASAN_FLAGS "-fsanitize=address -fno-omit-frame-pointer")
+      # Without no-omit-frame-pointer incomplete backtraces get stored.
+  set(RR_FLAGS "${ASAN_FLAGS} ${RR_FLAGS}")
+endif()
+
 set_source_files_properties(${RR_SOURCES}
                             PROPERTIES COMPILE_FLAGS ${RR_FLAGS})
 
@@ -626,7 +638,7 @@ else()
   set(CMAKE_INSTALL_INCLUDEDIR "include")
 endif()
 
-add_executable(rr ${RR_SOURCES} src/main.cc)
+add_executable(rr ${RR_SOURCES})
 set_target_properties(rr PROPERTIES ENABLE_EXPORTS true)
 post_build_executable(rr)
 set(RR_BIN rr)
@@ -637,6 +649,9 @@ option(strip "Strip debug info from rr binary")
 set(RR_MAIN_LINKER_FLAGS ${LINKER_FLAGS})
 if(strip)
   set(RR_MAIN_LINKER_FLAGS "-s ${RR_MAIN_LINKER_FLAGS}")
+endif()
+if (asan)
+  set(RR_MAIN_LINKER_FLAGS " ${ASAN_FLAGS} ${RR_MAIN_LINKER_FLAGS}")
 endif()
 
 # Add -flto option to linking step if release
@@ -665,6 +680,8 @@ if(staticlibs)
   target_link_libraries(rr -L/home/roc/lib -l:libcapnp.a -l:libkj.a)
   # Note that this works for both clang++ and g++
   set(RR_MAIN_LINKER_FLAGS "-static-libstdc++ ${RR_MAIN_LINKER_FLAGS}")
+elseif(ANDROID)
+  target_link_libraries(rr CapnProto::capnp)
 else()
   target_link_libraries(rr ${CAPNP_LDFLAGS})
 endif()
@@ -918,6 +935,7 @@ set(BASIC_TESTS
   daemon
   desched_blocking_poll
   desched_sigkill
+  detach_huge_mmap
   detach_state
   detach_threads
   detach_sigkill
@@ -933,6 +951,7 @@ set(BASIC_TESTS
   epoll_edge
   epoll_many
   epoll_pwait_eintr_sigmask
+  epoll_pwait2
   eventfd
   exec_flags
   exec_no_env
@@ -1082,8 +1101,10 @@ set(BASIC_TESTS
   x86/old_fork
   orphan_process
   packet_mmap_disable
+  x86/patch_syscall_restart
   pause
   perf_event
+  perf_event_ioctl
   perf_event_mmap
   personality
   pid_ns_kill_child
@@ -1425,6 +1446,7 @@ set(TESTS_WITH_PROGRAM
   mprotect_syscallbuf_overflow
   mutex_pi_stress
   nested_detach_wait
+  nested_detach_kill_stuck
   overflow_branch_counter
   patch_page_end
   x86/patch_40_80_f6_81
@@ -1558,6 +1580,7 @@ set(TESTS_WITHOUT_PROGRAM
   get_thread_list
   hardlink_mmapped_files
   hbreak
+  large_file
   mprotect_step
   nested_detach
   nested_detach_kill

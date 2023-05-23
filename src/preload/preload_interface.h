@@ -105,10 +105,8 @@ static inline const char* extract_file_name(const char* s) {
 /* Set this env var to enable syscall buffering. */
 #define SYSCALLBUF_ENABLED_ENV_VAR "_RR_USE_SYSCALLBUF"
 
-/* Size of table mapping fd numbers to syscallbuf-disabled flag.
- * Most Linux kernels limit fds to 1024 so it probably doesn't make sense
- * to raise this value... */
-#define SYSCALLBUF_FDS_DISABLED_SIZE 1024
+/* Size of table mapping fd numbers to syscallbuf-disabled flag. */
+#define SYSCALLBUF_FDS_DISABLED_SIZE 16384
 
 #define MPROTECT_RECORD_COUNT 1000
 
@@ -266,7 +264,13 @@ struct preload_globals {
    * syscallbuf_fd_class[SYSCALLBUF_FDS_DISABLED_SIZE - 1]. See the
    */
   VOLATILE char syscallbuf_fd_class[SYSCALLBUF_FDS_DISABLED_SIZE];
-  /* mprotect records. Set by preload. */
+
+  /* WARNING! SYSCALLBUF_FDS_DISABLED_SIZE can change, so
+     access to the following fields during replay is dangerous. Use
+     PRELOAD_GLOBALS_FIELD_AFTER_SYSCALLBUF_FDS_DISABLED or something
+     like it! */
+  /* mprotect records. Set by preload. Us
+     PRELOAD_GLOBALS_FIELD_AFTER_SYSCALLBUF_FDS_DISABLED to access. */
   struct mprotect_record mprotect_records[MPROTECT_RECORD_COUNT];
   /* Random seed that can be used for various purposes. DO NOT READ from rr
      during replay, because this field does not exist in old traces. */
@@ -276,13 +280,16 @@ struct preload_globals {
    * QUIRK: With UsesGlobalsInReplayQuirk:
    * Indicates the value (in 8-byte increments) at which to raise a SIGSEGV
    * trap once reached. NOTE: This remains constant during record, and is
-   * used only during replay. The same restrictions as in_replay above apply */
+   * used only during replay. The same restrictions as in_replay above apply.
+   *
+   * Use PRELOAD_GLOBALS_FIELD_AFTER_SYSCALLBUF_FDS_DISABLED to access during
+   * replay. */
   uint64_t reserved_legacy_breakpoint_value;
   /* Indicates whether or not all tasks in this address space have the same
      fd table. Set by rr during record (modifications are recorded).
-     Read by the syscallbuf */
+     Read by the syscallbuf. Not read during replay. */
   unsigned char fdt_uniform;
-  /* The CPU we're bound to, if any; -1 if not bound. */
+  /* The CPU we're bound to, if any; -1 if not bound. Not read during replay. */
   int32_t cpu_binding;
 };
 

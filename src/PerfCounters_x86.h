@@ -85,6 +85,8 @@ static CpuMicroarch compute_cpu_microarch() {
       return IntelAlderlake;
     case 0xb0670:
       return IntelRaptorlake;
+    case 0x806f0:
+      return IntelSapphireRapid;
     case 0x30f00:
       return AMDF15R30;
     case 0x00f10: // Naples, Whitehaven, Summit Ridge, Snowy Owl (Zen), Milan (Zen 3) (UNTESTED)
@@ -230,7 +232,7 @@ static void check_for_xen_pmi_bug(const perf_event_attrs &perf_attr) {
         "shll $3, %[accumulator];"
         "sub %%edx, %[accumulator];"
         // Add 2.
-        "add $2, %[accumulator];"
+        "addl $2, %[accumulator];"
         // Mask off bits.
         "andl $0xffffff, %[accumulator];"
         // And loop.

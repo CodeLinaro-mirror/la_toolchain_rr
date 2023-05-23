@@ -40,9 +40,7 @@ static void* tracee_attention_set_thread(__attribute__((unused)) void* p) {
 }
 
 void TraceeAttentionSet::initialize() {
-  pthread_mutex_lock(&attention_set_lock);
   if (attention_set) {
-    pthread_mutex_unlock(&attention_set_lock);
     return;
   }
   attention_set = new unordered_set<pid_t>();
@@ -51,7 +49,6 @@ void TraceeAttentionSet::initialize() {
   sigset_t set;
   sigfillset(&set);
   sigprocmask(SIG_BLOCK, &set, &original_mask);
-  pthread_mutex_unlock(&attention_set_lock);
 
   pthread_t thread;
   pthread_create(&thread, nullptr, tracee_attention_set_thread, nullptr);
@@ -71,19 +68,17 @@ unordered_set<pid_t> TraceeAttentionSet::read() {
   if (!attention_set) {
     FATAL() << "TraceeAttentionSet not initialized";
   }
-  result = move(*attention_set);
+  result = std::move(*attention_set);
   pthread_mutex_unlock(&attention_set_lock);
   return result;
 }
 
 void TraceeAttentionSet::get_original_sigmask(sigset_t* out) {
-  pthread_mutex_lock(&attention_set_lock);
   if (attention_set) {
     *out = original_mask;
   } else {
     sigprocmask(SIG_BLOCK, nullptr, out);
   }
-  pthread_mutex_unlock(&attention_set_lock);
 }
 
 } // namespace rr

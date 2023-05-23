@@ -162,7 +162,7 @@ static void dump_syscallbuf_data(TraceReader& trace, FILE* out,
       if (!(record.prot & PROT_EXEC)) {
         prot_flags[2] = '-';
       }
-      fprintf(out, "  { start:'%p', size:'%lx', prot:%s }\n",
+      fprintf(out, "  { start:'%p', size:'%" PRIx64 "', prot:%s }\n",
               (void*)record.start, record.size, prot_flags);
     }
   }
@@ -267,7 +267,7 @@ static void dump_events_matching(TraceReader& trace, const DumpFlags& flags,
   bool process_raw_data =
       flags.dump_syscallbuf || flags.dump_recorded_data_metadata;
   while (!trace.at_end()) {
-    auto frame = trace.read_frame();
+    auto frame = trace.read_frame(start);
     if (end < frame.time()) {
       return;
     }

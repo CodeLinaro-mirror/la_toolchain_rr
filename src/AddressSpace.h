@@ -239,6 +239,14 @@ struct WatchConfig {
   remote_ptr<void> addr;
   size_t num_bytes;
   WatchType type;
+
+  bool operator==(const WatchConfig& other) const {
+    return addr == other.addr && num_bytes == other.num_bytes &&
+      type == other.type;
+  }
+  bool operator!=(const WatchConfig& other) const {
+    return !(*this == other);
+  }
 };
 
 /**
@@ -303,12 +311,6 @@ public:
   typedef std::shared_ptr<AddressSpace> shr_ptr;
 
   virtual ~AddressSpace();
-
-  /**
-   * Call this after a new task has been cloned within this
-   * address space.
-   */
-  void after_clone();
 
   /**
    * Call this after a successful execve syscall has completed. At this point
@@ -628,6 +630,14 @@ public:
       DONT_UPDATE_WATCHPOINT_REGISTER_ASSIGNMENTS);
   }
 
+  /**
+   * Get hardware watchpoint assignments.
+   */
+  std::vector<WatchConfig> get_hw_watchpoints() {
+    return get_watchpoints_internal(ALL_WATCHPOINTS, ALIGNED,
+      DONT_UPDATE_WATCHPOINT_REGISTER_ASSIGNMENTS);
+  }
+
   void set_shm_size(remote_ptr<void> addr, size_t bytes) {
     shm_sizes[addr] = bytes;
   }
@@ -663,6 +673,9 @@ public:
 
   ScopedFd& mem_fd() { return child_mem_fd; }
   void set_mem_fd(ScopedFd&& fd) { child_mem_fd = std::move(fd); }
+
+  ScopedFd& pagemap_fd() { return child_pagemap_fd; }
+  void set_pagemap_fd(ScopedFd&& fd) { child_pagemap_fd = std::move(fd); }
 
   Monkeypatcher& monkeypatcher() {
     DEBUG_ASSERT(monkeypatch_state);
@@ -947,11 +960,14 @@ private:
    * Pass |ITERATE_CONTIGUOUS| to stop iterating when the last
    * contiguous mapping after |addr| within the region is seen.
    * Default is to iterate all mappings in the region.
+   *
+   * The callback takes parameters by value to avoid dangling
+   * references if the memory map is modified inside the callback.
    */
   enum { ITERATE_DEFAULT, ITERATE_CONTIGUOUS };
   void for_each_in_range(
       remote_ptr<void> addr, ssize_t num_bytes,
-      std::function<void(const Mapping& m, const MemoryRange& rem)> f,
+      std::function<void(Mapping m, MemoryRange rem)> f,
       int how = ITERATE_DEFAULT);
 
   /**
@@ -1196,6 +1212,8 @@ private:
                                      const struct map_iterator_data* data);
 
   AddressSpace operator=(const AddressSpace&) = delete;
+
+  ScopedFd child_pagemap_fd;
 };
 
 /**

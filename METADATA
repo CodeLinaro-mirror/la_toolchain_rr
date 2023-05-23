@@ -13,11 +13,11 @@ third_party {
     type: GIT
     value: "https://github.com/rr-debugger/rr"
   }
-  version: "f85b6b6712297a140f95dd7b23964a7bedf7adc3"
+  version: "32167ae8b4b2c66c4d81aa38873fbf4a11f12059"
   license_type: NOTICE
   last_upgrade_date {
     year: 2023
-    month: 3
+    month: 5
     day: 23
   }
 }

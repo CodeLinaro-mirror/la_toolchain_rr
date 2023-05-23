@@ -242,8 +242,6 @@ AddressSpace::~AddressSpace() {
   session_->on_destroy(this);
 }
 
-void AddressSpace::after_clone() { allocate_watchpoints(); }
-
 static uint32_t find_offset_of_syscall_instruction_in(SupportedArch arch,
                                                       uint8_t* vdso_data,
                                                       size_t vdso_len) {
@@ -284,7 +282,7 @@ void AddressSpace::map_rr_page(AutoRemoteSyscalls& remote) {
   Task* t = remote.task();
   SupportedArch arch = t->arch();
 
-  const char *fname;
+  const char *fname = nullptr;
   switch (t->arch()) {
     case x86_64:
     case aarch64:
@@ -888,11 +886,10 @@ void AddressSpace::protect(Task* t, remote_ptr<void> addr, size_t num_bytes,
              << ")";
 
   MemoryRange last_overlap;
-  auto protector = [this, prot, &last_overlap](const Mapping& mm,
-                                               const MemoryRange& rem) {
+  auto protector = [this, prot, &last_overlap](Mapping m,
+                                               MemoryRange rem) {
     LOG(debug) << "  protecting (" << rem << ") ...";
 
-    Mapping m = std::move(mm);
     remove_from_map(m.map);
 
     // PROT_GROWSDOWN means that if this is a grows-down segment
@@ -1307,10 +1304,9 @@ void AddressSpace::unmap_internal(Task*, remote_ptr<void> addr,
                                   ssize_t num_bytes) {
   LOG(debug) << "munmap(" << addr << ", " << num_bytes << ")";
 
-  auto unmapper = [this](const Mapping& mm, const MemoryRange& rem) {
+  auto unmapper = [this](Mapping m, MemoryRange rem) {
     LOG(debug) << "  unmapping (" << rem << ") ...";
 
-    Mapping m = std::move(mm);
     remove_from_map(m.map);
 
     LOG(debug) << "  erased (" << m.map << ") ...";
@@ -1533,9 +1529,9 @@ static void assert_segments_match(Task* t, const KernelMapping& input_m,
     err = "inodes differ";
   }
   if (err.size()) {
-    LOG(error) << "cached mmap:";
+    cerr << "cached mmap:" << endl;
     t->vm()->dump();
-    LOG(error) << "/proc/" << t->tid << "/mmaps:";
+    cerr << "/proc/" << t->tid << "/mmaps:" << endl;
     AddressSpace::print_process_maps(t);
     ASSERT(t, false) << "\nCached mapping " << m << " should be " << km << "; "
                      << err;
@@ -1550,12 +1546,11 @@ void AddressSpace::ensure_replay_matches_single_recorded_mapping(Task* t, Memory
   ASSERT(t, range.start() == floor_page_size(range.start()));
   ASSERT(t, range.end() == ceil_page_size(range.end()));
 
-  auto fixer = [this, t, range](const Mapping& mm, const MemoryRange&) {
-    if (mm.map == range) {
+  auto fixer = [this, t, range](Mapping mapping, MemoryRange) {
+    if (mapping.map == range) {
       // Existing single mapping covers entire range; nothing to do.
       return;
     }
-    Mapping mapping = std::move(mm);
 
     // These should be null during replay
     ASSERT(t, !mapping.mapped_file_stat);
@@ -1697,6 +1692,7 @@ AddressSpace::AddressSpace(Task* t, const string& exe, uint32_t exec_count)
   }
 }
 
+// Does not copy the task set; the new AddressSpace will be for new tasks.
 AddressSpace::AddressSpace(Session* session, const AddressSpace& o,
                            pid_t leader_tid, uint32_t leader_serial,
                            uint32_t exec_count)
@@ -1886,25 +1882,17 @@ bool AddressSpace::has_exec_watchpoint_fired(remote_code_ptr addr) {
 }
 
 bool AddressSpace::allocate_watchpoints() {
-  Task::DebugRegs regs = get_watchpoints_internal(ALL_WATCHPOINTS, ALIGNED,
+  vector<WatchConfig> regs = get_watchpoints_internal(ALL_WATCHPOINTS, ALIGNED,
       UPDATE_WATCHPOINT_REGISTER_ASSIGNMENTS);
 
-  if (regs.size() <= 0x7f) {
-    bool ok = true;
-    for (auto t : task_set()) {
-      if (!t->set_debug_regs(regs)) {
-        ok = false;
-      }
-    }
-    if (ok) {
-      return true;
-    }
+  if (task_set().empty()) {
+    // We can't validate the watchpoint set in this case
+    FATAL() << "No tasks???";
+  }
+  if ((*task_set().begin())->set_debug_regs(regs)) {
+    return true;
   }
 
-  regs.clear();
-  for (auto t2 : task_set()) {
-    t2->set_debug_regs(regs);
-  }
   for (auto kv : watchpoints) {
     kv.second.debug_regs_for_exec_read.clear();
   }
@@ -2015,7 +2003,7 @@ void AddressSpace::maybe_update_breakpoints(Task* t, remote_ptr<uint8_t> addr,
 
 void AddressSpace::for_each_in_range(
     remote_ptr<void> addr, ssize_t num_bytes,
-    function<void(const Mapping& m, const MemoryRange& rem)> f, int how) {
+    function<void(Mapping m, MemoryRange rem)> f, int how) {
   remote_ptr<void> region_start = floor_page_size(addr);
   remote_ptr<void> last_unmapped_end = region_start;
   remote_ptr<void> region_end = ceil_page_size(addr + num_bytes);

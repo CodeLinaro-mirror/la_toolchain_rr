@@ -144,22 +144,27 @@ void Task::wait_exit() {
    */
   WaitOptions options(tid);
   options.consume = false;
-  WaitResult result = WaitManager::wait_stop(options);
-  if (result.code == WAIT_OK) {
-    if (result.status.ptrace_event() == PTRACE_EVENT_EXIT) {
-      // It's possible that the earlier exit event was synthetic, in which
-      // case we're only now catching up to the real process exit. In that
-      // case, just ask the process to actually exit. (TODO: We may want to
-      // catch this earlier).
-      return proceed_to_exit(true);
+  do {
+    WaitResult result = WaitManager::wait_stop(options);
+    if (result.code == WAIT_OK) {
+      if (result.status.ptrace_event() == PTRACE_EVENT_EXIT) {
+        // It's possible that the earlier exit event was synthetic, in which
+        // case we're only now catching up to the real process exit. In that
+        // case, just ask the process to actually exit. (TODO: We may want to
+        // catch this earlier).
+        return proceed_to_exit(true);
+      }
+      ASSERT(this, result.status.ptrace_event() == PTRACE_EVENT_EXEC)
+        << "Expected PTRACE_EVENT_EXEC, got " << result.status;
+      // The kernel will do the reaping for us in this case
+      was_reaped = true;
+    } else if (result.code == WAIT_NO_STATUS) {
+      // Wait was EINTR'd most likely - retry.
+      continue;
+    } else {
+      ASSERT(this, result.code == WAIT_NO_CHILD);
     }
-    ASSERT(this, result.status.ptrace_event() == PTRACE_EVENT_EXEC)
-      << "Expected PTRACE_EVENT_EXEC, got " << result.status;
-    // The kernel will do the reaping for us in this case
-    was_reaped = true;
-  } else {
-    ASSERT(this, result.code == WAIT_NO_CHILD);
-  }
+  } while (false);
 }
 
 void Task::proceed_to_exit(bool wait) {
@@ -1186,7 +1191,9 @@ bool Task::set_aarch64_debug_regs(int, ARM64Arch::user_hwdebug_state *, size_t) 
   FATAL() << "Reached aarch64 code path on non-aarch64 system";
   return false;
 }
-bool Task::get_aarch64_debug_regs(int, ARM64Arch::user_hwdebug_state *) {
+bool Task::get_aarch64_debug_regs(int, ARM64Arch::user_hwdebug_state *regs) {
+  // Following memset just to silence a warning about dbg_info may be used uninitialized.
+  memset(regs, 0, sizeof(*regs));
   FATAL() << "Reached aarch64 code path on non-aarch64 system";
   return false;
 }
@@ -1397,6 +1404,10 @@ void Task::work_around_KNL_string_singlestep_bug() {
 
 void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
                             TicksRequest tick_period, int sig) {
+  // Ensure our HW debug registers are up to date before we execute any code.
+  // If this fails because the task died, the code below will detect it.
+  set_debug_regs(vm()->get_hw_watchpoints());
+
   bool setup_succeeded = will_resume_execution(how, wait_how, tick_period, sig);
 
   // During record, the process could have died, but otherwise, we control
@@ -1656,7 +1667,7 @@ union PackedDebugControl {
   DebugControl ctl;
 };
 
-static bool set_x86_debug_regs(Task *t, const Task::DebugRegs& regs) {
+static bool set_x86_debug_regs(Task *t, const Task::HardwareWatchpoints& regs) {
   // Reset the debug status since we're about to change the set
   // of programmed watchpoints.
   t->set_x86_debug_reg(6, 0);
@@ -1677,6 +1688,10 @@ static bool set_x86_debug_regs(Task *t, const Task::DebugRegs& regs) {
     dr7.ctl.enable(i, BYTES_1, WATCH_EXEC);
   }
   t->set_x86_debug_reg(7, dr7.packed);
+  if (regs.empty()) {
+    // Don't do another redundant poke to DR7.
+    return true;
+  }
 
   size_t index = 0;
   for (auto reg : regs) {
@@ -1691,11 +1706,14 @@ static bool set_x86_debug_regs(Task *t, const Task::DebugRegs& regs) {
 }
 
 template <typename Arch>
-static bool set_debug_regs_arch(Task* t, const Task::DebugRegs& regs);
-template <> bool set_debug_regs_arch<X86Arch>(Task* t, const Task::DebugRegs& regs) {
+static bool set_debug_regs_arch(Task* t,
+                                const Task::HardwareWatchpoints& regs);
+template <> bool set_debug_regs_arch<X86Arch>(Task* t,
+                                              const Task::HardwareWatchpoints& regs) {
   return set_x86_debug_regs(t, regs);
 }
-template <> bool set_debug_regs_arch<X64Arch>(Task* t, const Task::DebugRegs& regs) {
+template <> bool set_debug_regs_arch<X64Arch>(Task* t,
+                                              const Task::HardwareWatchpoints& regs) {
   return set_x86_debug_regs(t, regs);
 }
 
@@ -1709,7 +1727,8 @@ static void query_max_bp_wp(Task* t, ssize_t* max_bp, ssize_t* max_wp) {
   *max_wp = wps.dbg_info & 0xff;
 }
 
-template <> bool set_debug_regs_arch<ARM64Arch>(Task* t, const Task::DebugRegs& regs) {
+template <> bool set_debug_regs_arch<ARM64Arch>(Task* t,
+                                                const Task::HardwareWatchpoints& regs) {
   ARM64Arch::user_hwdebug_state bps;
   ARM64Arch::user_hwdebug_state wps;
   memset(&bps, 0, sizeof(bps));
@@ -1778,8 +1797,21 @@ template <> bool set_debug_regs_arch<ARM64Arch>(Task* t, const Task::DebugRegs& 
          t->set_aarch64_debug_regs(NT_ARM_HW_WATCH, &wps, max_wp);
 }
 
-bool Task::set_debug_regs(const DebugRegs& regs) {
-  RR_ARCH_FUNCTION(set_debug_regs_arch, arch(), this, regs);
+static bool set_debug_regs_internal(Task* t, const Task::HardwareWatchpoints& regs) {
+  RR_ARCH_FUNCTION(set_debug_regs_arch, t->arch(), t, regs);
+}
+
+bool Task::set_debug_regs(const HardwareWatchpoints& regs) {
+  if (regs == current_hardware_watchpoints) {
+    return true;
+  }
+  bool ret = set_debug_regs_internal(this, regs);
+  if (ret) {
+    current_hardware_watchpoints = regs;
+  } else {
+    current_hardware_watchpoints.clear();
+  }
+  return ret;
 }
 
 static void set_thread_area(std::vector<X86Arch::user_desc>& thread_areas_,
@@ -2385,6 +2417,21 @@ Task* Task::clone(CloneReason reason, int flags, remote_ptr<void> stack,
 
   t->post_vm_clone(reason, flags, this);
 
+  // Copy debug register values. We assume the kernel will either copy debug
+  // registers into the new task, or the debug registers will be unset
+  // in the new task. If we have no HW watchpoints then debug registers
+  // will definitely be unset in the new task so there is nothing to do.
+  if (!current_hardware_watchpoints.empty()) {
+    // Copy debug register settings into the new task so we're in a known state.
+    bool ret = set_debug_regs_internal(t, current_hardware_watchpoints);
+    if (!ret) {
+      LOG(warn) << "Failed to initialize new task's debug registers; "
+                << "this should always work since we were able to set them in the old task, "
+                << "but the new task might have been killed";
+    }
+    t->current_hardware_watchpoints = current_hardware_watchpoints;
+  }
+
   return t;
 }
 
@@ -2678,6 +2725,18 @@ void Task::open_mem_fd_if_needed() {
   if (!as->mem_fd().is_open()) {
     open_mem_fd();
   }
+}
+
+ScopedFd& Task::pagemap_fd() {
+  if (!as->pagemap_fd().is_open()) {
+    ScopedFd fd(proc_pagemap_path().c_str(), O_RDONLY);
+    if (fd.is_open()) {
+      as->set_pagemap_fd(std::move(fd));
+    } else {
+      LOG(info) << "Can't retrieve pagemap fd for " << tid;
+    }
+  }
+  return as->pagemap_fd();
 }
 
 KernelMapping Task::init_syscall_buffer(AutoRemoteSyscalls& remote,
@@ -3635,6 +3694,66 @@ static void copy_mem_mapping(Task* from, Task* to, const KernelMapping& km) {
   }
 }
 
+// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/proc/task_mmu.c?h=v6.3#n1352
+#define PM_PRESENT (1ULL << 63)
+#define PM_SWAP    (1ULL << 62)
+
+static bool copy_mem_mapping_just_used(Task* from, Task* to, const KernelMapping& km)
+{
+  ScopedFd& fd = from->pagemap_fd();
+  if (!fd.is_open()) {
+    LOG(debug) << "Failed to open " << from->proc_pagemap_path();
+    return false;
+  }
+
+  size_t pagesize = page_size();
+  uint64_t pages_present = 0; // Just for logging
+
+  const int max_buf_size = 65536;
+  vector<uint64_t> buf;
+
+  for (uintptr_t page_offset = 0; page_offset < km.size() / pagesize; page_offset += max_buf_size) {
+    auto page_read_offset = (km.start().as_int() / pagesize + page_offset);
+    size_t page_read_count = min<size_t>(max_buf_size, km.size() / pagesize - page_offset);
+    buf.resize(page_read_count);
+    size_t bytes_read = pread(fd, buf.data(), page_read_count * sizeof(uint64_t), page_read_offset * sizeof(uint64_t));
+    ASSERT(from, bytes_read == page_read_count * sizeof(uint64_t));
+
+    // A chunk was read from pagemap above, now iterate through it to detect
+    // if memory is physically present (bit 63, PM_PRESENT) or in swap (bit 62, PM_SWAP) in Task "from".
+    // If yes, just transfer those pages to the new Task "to".
+    // Also try to find consecutive pages to copy them in one operation.
+    // The file /proc/PID/pagemap consists of 64-bit values, each describing
+    // the state of one page. See https://www.kernel.org/doc/Documentation/vm/pagemap.txt
+
+    for (size_t page = 0; page < page_read_count; ++page) {
+      if (buf[page] & (PM_PRESENT | PM_SWAP)) {
+        auto start = km.start() + (page_offset + page) * pagesize;
+        if (start >= km.end()) {
+          break;
+        }
+        ++pages_present;
+
+        // Check for consecutive used pages
+        while (page + 1 < page_read_count &&
+               buf[page + 1] & (PM_PRESENT | PM_SWAP))
+        {
+          ++page;
+          ++pages_present;
+        }
+
+        auto end = km.start() + (page_offset + page + 1) * pagesize;
+        LOG(debug) << km << " copying start: 0x" << hex << start << " end: 0x" << end
+                   << dec << " pages: " << (end - start) / pagesize;
+        auto pages = km.subrange(start, end);
+        copy_mem_mapping(from, to, pages);
+      }
+    }
+  }
+  LOG(debug) << km << " pages_present: " << pages_present << " pages_total: " << km.size() / pagesize;
+  return true;
+}
+
 static void move_vdso_mapping(AutoRemoteSyscalls &remote, const KernelMapping &km) {
   for (const auto& m : remote.task()->vm()->maps()) {
     if  (m.map.is_vdso() && m.map.start() != km.start()) {
@@ -3722,6 +3841,16 @@ void Task::dup_from(Task *other) {
       create_mapping(this, remote_this, km);
       LOG(debug) << "Copying mapping into " << tid;
       if (!(km.flags() & MAP_SHARED)) {
+        // Make the effort just for bigger mappings, copy smaller as a whole.
+        if ((km.flags() & MAP_ANONYMOUS) &&
+            km.size() >= 0x400000/*4MB*/)
+        {
+          LOG(debug) << "Using copy_mem_mapping_just_used";
+          if (copy_mem_mapping_just_used(other, this, km)) {
+            continue;
+          }
+          LOG(debug) << "Fallback to copy_mem_mapping";
+        }
         copy_mem_mapping(other, this, km);
       }
     }

@@ -1,12 +1,12 @@
 source `dirname $0`/util.sh
 
 NEST_EXE=nested_detach_wait
-SLEEP_EXE=term_trace_syscall
+SLEEP_EXE=nested_detach_kill_stuck
 SYNC_TOKEN=sleeping
 WAIT_SECS=1
 
 mkdir $workdir/inner
-RECORD_ARGS="--env=_RR_TRACE_DIR=$workdir/inner"
+RECORD_ARGS="--wait --env=_RR_TRACE_DIR=$workdir/inner"
 save_exe "$NEST_EXE"
 save_exe "$SLEEP_EXE"
 touch record.out

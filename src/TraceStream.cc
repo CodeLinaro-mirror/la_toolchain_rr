@@ -27,6 +27,7 @@
 #include "kernel_abi.h"
 #include "kernel_supplement.h"
 #include "log.h"
+#include "preload/preload_interface.h"
 #include "rr_trace.capnp.h"
 #include "util.h"
 
@@ -171,9 +172,7 @@ public:
     return maxBytes;
   }
   virtual void skip(size_t bytes) {
-    if (!reader.skip(bytes)) {
-      throw IOException();
-    }
+    reader.skip(bytes);
   }
   virtual kj::ArrayPtr<const capnp::byte> tryGetReadBuffer() {
     const uint8_t* p;
@@ -532,14 +531,16 @@ void TraceWriter::write_frame(RecordTask* t, const Event& ev,
   tick_time();
 }
 
-TraceFrame TraceReader::read_frame() {
+TraceFrame TraceReader::read_frame(FrameTime skip_before) {
   auto& events = reader(EVENTS);
   word buf[reasonable_frame_message_words];
   CompressedReaderInputStream stream(events);
   PackedMessageReader frame_msg(stream, ReaderOptions(), buf);
-  trace::Frame::Reader frame = frame_msg.getRoot<trace::Frame>();
-
   tick_time();
+  TraceFrame ret;
+  ret.global_time = time();
+
+  trace::Frame::Reader frame = frame_msg.getRoot<trace::Frame>();
 
   auto mem_writes = frame.getMemWrites();
   raw_recs.resize(mem_writes.size());
@@ -556,8 +557,10 @@ TraceFrame TraceReader::read_frame() {
     raw_recs[i] = { w.getAddr(), (size_t)w.getSize(), i32_to_tid(w.getTid()), h };
   }
 
-  TraceFrame ret;
-  ret.global_time = time();
+  if (ret.global_time < skip_before) {
+    return ret;
+  }
+
   ret.tid_ = i32_to_tid(frame.getTid());
   ret.ticks_ = frame.getTicks();
   if (ret.ticks_ < 0) {
@@ -1410,6 +1413,7 @@ void TraceWriter::close(CloseStatus status, const TraceUuid* uuid) {
   header.setRequiredForwardCompatibilityVersion(FORWARD_COMPATIBILITY_VERSION);
   header.setPreloadThreadLocalsRecorded(true);
   header.setRrcallBase(syscall_number_for_rrcall_init_preload(x86_64));
+  header.setSyscallbufFdsDisabledSize(SYSCALLBUF_FDS_DISABLED_SIZE);
 
   header.setNativeArch(to_trace_arch(NativeArch::arch()));
   if (NativeArch::is_x86ish())
@@ -1595,6 +1599,7 @@ TraceReader::TraceReader(const string& dir)
   preload_thread_locals_recorded_ = header.getPreloadThreadLocalsRecorded();
   ticks_semantics_ = from_trace_ticks_semantics(header.getTicksSemantics());
   rrcall_base_ = header.getRrcallBase();
+  syscallbuf_fds_disabled_size_ = header.getSyscallbufFdsDisabledSize();
   required_forward_compatibility_version_ = header.getRequiredForwardCompatibilityVersion();
   quirks_ = 0;
   {

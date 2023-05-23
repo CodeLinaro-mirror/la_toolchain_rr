@@ -353,8 +353,11 @@ public:
    * NB: reading a trace frame has the side effect of ticking
    * the global time to match the time recorded in the trace
    * frame.
+   *
+   * For all frames before `skip_before` we only fill in the `global_time`
+   * field. (Raw data and maps are still accessible.)
    */
-  TraceFrame read_frame();
+  TraceFrame read_frame(FrameTime skip_before = 0);
 
   /**
    * Read the next mapped region descriptor and return it.
@@ -464,6 +467,7 @@ public:
 
   // The base syscall number for rr syscalls in this trace
   int rrcall_base() const { return rrcall_base_; }
+  uint32_t syscallbuf_fds_disabled_size() const { return syscallbuf_fds_disabled_size_; }
 
   SupportedArch arch() const { return arch_; }
 
@@ -511,6 +515,7 @@ private:
   bool chaos_mode_known_;
   bool chaos_mode_;
   int rrcall_base_;
+  uint32_t syscallbuf_fds_disabled_size_;
   int required_forward_compatibility_version_;
   SupportedArch arch_;
   int quirks_;
