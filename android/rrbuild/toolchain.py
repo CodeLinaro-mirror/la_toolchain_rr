@@ -21,7 +21,7 @@ from pathlib import Path
 from .paths import ANDROID_DIR
 from .target import Target
 
-CLANG_VERSION = "clang-r487747"
+CLANG_VERSION = "clang-r487747c"
 NDK_VERSION = "r25"
 
 
