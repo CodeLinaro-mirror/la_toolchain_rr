@@ -154,6 +154,8 @@ public:
 
   /**
    * Advance the task to its exit state if it's not already there.
+   * If `wait` is false, then during recording Scheduler::start() must be
+   * called.
    */
   void proceed_to_exit(bool wait = true);
 
@@ -268,12 +270,10 @@ public:
   /**
    * Return the ptrace message pid associated with the current ptrace
    * event, f.e. the new child's pid at PTRACE_EVENT_CLONE.
+   * Returns -1 if the ptrace returns ESRCH, i.e. the task is not in a
+   * ptrace-stop.
    */
-  template <typename T> T get_ptrace_eventmsg() {
-    unsigned long msg = 0;
-    xptrace(PTRACE_GETEVENTMSG, nullptr, &msg);
-    return T(msg);
-  }
+  pid_t get_ptrace_eventmsg_pid();
 
   /**
    * Return the siginfo at the signal-stop of this.
@@ -483,6 +483,8 @@ public:
    */
   virtual bool already_exited() const { return false; }
 
+  virtual bool is_detached_proxy() const { return false; }
+
   /**
    * Read |N| bytes from |child_addr| into |buf|, or don't
    * return.
@@ -597,6 +599,8 @@ public:
   /**
    * Read the aarch64 TLS register via ptrace. Returns true on success, false
    * on failure. On success `result` is set to the tracee's TLS register.
+   * This can only fail when ptrace_if_stopped fails, i.e. the tracee
+   * is on the exit path due to a SIGKILL or equivalent.
    */
   bool read_aarch64_tls_register(uintptr_t *result);
   void set_aarch64_tls_register(uintptr_t val);
@@ -639,9 +643,15 @@ public:
   void set_status(WaitStatus status) { wait_status = status; }
 
   /**
-   * Return true when the task is running, false if it's stopped.
+   * Return true when the task stopped for a ptrace-stop and we
+   * haven't resumed it yet.
    */
-  bool is_running() const { return !is_stopped; }
+  bool is_stopped() const { return is_stopped_; }
+
+  /**
+   * Setter for `is_stopped_` to update `Scheduler::ntasks_stopped`.
+   */
+  virtual void set_stopped(bool stopped) { is_stopped_ = stopped; }
 
   /**
    * Return the status of this as of the last successful wait()/try_wait() call.
@@ -704,11 +714,6 @@ public:
    * interrupt_after_elapsed == 0.0, the interrupt will happen immediately.
    */
   void wait(double interrupt_after_elapsed = -1);
-  /**
-   * Return true if an unexpected exit was already detected for this task and
-   * it is ready to be reported.
-   */
-  bool wait_unexpected_exit();
 
   /**
    * Currently we don't allow recording across uid changes, so we can
@@ -826,10 +831,13 @@ public:
   ScopedFd& pagemap_fd();
 
   /**
-   * Perform a PTRACE_INTERRUPT set up the counter for potential spurious stops
+   * Perform a PTRACE_INTERRUPT and set up the counter for potential spurious stops
    * to be detected in `account_for_potential_ptrace_interrupt_stop`.
+   * Returns true if it succeeded, false if we got ESRCH (i.e. the tracee has
+   * disappeared or is not being ptraced; PTRACE_INTERRUPT doesn't require the
+   * tracee to be stopped).
    */
-  void do_ptrace_interrupt();
+  bool do_ptrace_interrupt();
 
   /**
    * Sometimes we use PTRACE_INTERRUPT to kick the tracee out of various
@@ -984,15 +992,38 @@ public:
   }
 
   /**
-   * Like |fallible_ptrace()| but infallible for most purposes.
-   * Errors other than ESRCH are treated as fatal. Returns false if
-   * we got ESRCH. This can happen any time during recording when the
-   * task gets a SIGKILL from outside.
+   * Executes a ptrace() call that expects the task to be in a ptrace-stop.
+   * Errors other than ESRCH are treated as fatal (those are rr bugs).
+   * Only call this when `Task::is_stopped_`.
+   * Even when `is_stopped_` is true, this can return false because the kernel
+   * could have pushed the task out of the ptrace-stop due to SIGKILL or
+   * equivalent (such as `zap_pid_ns_processes`).
+   *
+   * So when this returns false, one of the following is true:
+   * * The tracee is executing towards its PTRACE_EVENT_EXIT stop. This
+   * happens concurrently with rr so it may enter that stop at any time.
+   * But it can also be indefinitely delayed before reaching the exit stop,
+   * e.g. waiting in`zap_pid_ns_processes`.
+   * * In older kernels (before 9a95f78eab70deeb5a4c879c19b841a6af5b66e7)
+   * it is possible for a tracee stopped in PTRACE_EVENT_EXIT to be kicked
+   * out of that stop by another SIGKILL. In that case it is executing towards
+   * or has actually reached the zombie state. In old kernels it can be
+   * blocked indefinitely from reaching the zombie state due to coredumping.
+   *
+   * In either of these cases, the tracee has been killed via SIGKILL or equivalent
+   * and will not execute user code or system calls again. We can assume
+   * its registers won't change again. It won't handle any more signals.
    */
-  bool ptrace_if_alive(int request, remote_ptr<void> addr, void* data);
+  bool ptrace_if_stopped(int request, remote_ptr<void> addr, void* data);
 
-  bool is_dying() const {
-    return seen_ptrace_exit_event || detected_unexpected_exit;
+  /**
+   * Make the ptrace |request| with |addr| and |data|, return
+   * the ptrace return value. Just a very thin wrapper around the syscall.
+   */
+  long fallible_ptrace(int request, remote_ptr<void> addr, void* data);
+
+  bool seen_ptrace_exit_event() const {
+    return seen_ptrace_exit_event_;
   }
 
   void did_handle_ptrace_exit_event();
@@ -1001,8 +1032,11 @@ public:
     return address_of_last_execution_resume;
   }
 
-  bool already_reaped() const {
-    return was_reaped;
+  bool was_reaped() const {
+    return was_reaped_;
+  }
+  bool handled_ptrace_exit_event() const {
+    return handled_ptrace_exit_event_;
   }
 
   void os_exec(SupportedArch arch, std::string filename);
@@ -1129,18 +1163,6 @@ protected:
   void copy_state(const CapturedState& state);
 
   /**
-   * Make the ptrace |request| with |addr| and |data|, return
-   * the ptrace return value.
-   */
-  long fallible_ptrace(int request, remote_ptr<void> addr, void* data);
-
-  /**
-   * Like |fallible_ptrace()| but completely infallible.
-   * All errors are treated as fatal.
-   */
-  void xptrace(int request, remote_ptr<void> addr, void* data);
-
-  /**
    * Read tracee memory using PTRACE_PEEKDATA calls. Slow, only use
    * as fallback. Returns number of bytes actually read.
    */
@@ -1228,7 +1250,7 @@ protected:
   // Count of all ticks seen by this task since tracees became
   // consistent and the task last wait()ed.
   Ticks ticks;
-  // When |is_stopped|, these are our child registers.
+  // When |is_stopped_|, these are our child registers.
   Registers registers;
   // Where we last resumed execution
   remote_code_ptr address_of_last_execution_resume;
@@ -1245,16 +1267,16 @@ protected:
   // We need this in addition to `singlestepping_instruction` because that
   // might be CPUID but we failed to set the breakpoint.
   bool did_set_breakpoint_after_cpuid;
-  // True when we know via waitpid() that the task is stopped and we haven't
-  // resumed it.
-  bool is_stopped;
+  // True when we know via waitpid() that the task was stopped in
+  // a ptrace-stop and we haven't resumed it.
+  // It is possible that the task has been pushed out of the ptrace-stop
+  // without our knowledge, due to a SIGKILL or equivalent such as
+  // zap_pid_ns_processes.
+  bool is_stopped_;
   /* True when the seccomp filter has been enabled via prctl(). This happens
    * in the first system call issued by the initial tracee (after it returns
    * from kill(SIGSTOP) to synchronize with the tracer). */
   bool seccomp_bpf_enabled;
-  // True when we consumed a PTRACE_EVENT_EXIT that was about to race with
-  // a resume_execution, that was issued while stopped (i.e. SIGKILL).
-  bool detected_unexpected_exit;
   // True when 'registers' has changes that haven't been flushed back to the
   // task yet.
   bool registers_dirty;
@@ -1284,7 +1306,7 @@ protected:
   siginfo_t pending_siginfo;
   // True when a PTRACE_EXIT_EVENT has been observed in the wait_status
   // for this task.
-  bool seen_ptrace_exit_event;
+  bool seen_ptrace_exit_event_;
   // True when a PTRACE_EXIT_EVENT has been handled for this task.
   // By handled we mean either RecordSession's handle_ptrace_exit_event was
   // run (or the replay equivalent) or we recognized that the task is already
@@ -1292,13 +1314,13 @@ protected:
   // or anything like that in an already deceased task.
   // We might defer handling the exit (e.g. if there's an ongoing execve).
   // If this is true, `seen_ptrace_exit_event` must be true.
-  bool handled_ptrace_exit_event;
+  bool handled_ptrace_exit_event_;
 
   // A counter for the number of stops for which the stop may have been caused
   // by PTRACE_INTERRUPT. See description in do_waitpid
   int expecting_ptrace_interrupt_stop;
 
-  bool was_reaped;
+  bool was_reaped_;
   // Let this Task object be destroyed with no consequences.
   bool forgotten;
 

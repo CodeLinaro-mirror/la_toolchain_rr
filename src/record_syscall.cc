@@ -2384,7 +2384,7 @@ static bool verify_ptrace_options(RecordTask* t,
   // We "support" PTRACE_O_SYSGOOD because we don't support PTRACE_SYSCALL yet
   static const int supported_ptrace_options =
       PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXIT | PTRACE_O_TRACEFORK |
-      PTRACE_O_TRACECLONE | PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXEC;
+      PTRACE_O_TRACECLONE | PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEVFORKDONE;
 
   if ((int)t->regs().arg4() & ~supported_ptrace_options) {
     LOG(debug) << "Unsupported ptrace options " << HEX(t->regs().arg4());
@@ -2919,11 +2919,12 @@ static Switchable prepare_ptrace(RecordTask* t,
     case PTRACE_INTERRUPT: {
       RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid, false);
       if (tracee) {
-        if (tracee->is_running()) {
+        if (!tracee->is_stopped()) {
           // Running in a blocked syscall. Forward the PTRACE_INTERRUPT.
           // Regular syscall exit handling will take over from here.
-          bool alive = tracee->ptrace_if_alive(PTRACE_INTERRUPT, nullptr, nullptr);
-          syscall_state.emulate_result(alive ? 0 : -ESRCH);
+          errno = 0;
+          tracee->fallible_ptrace(PTRACE_INTERRUPT, nullptr, nullptr);
+          syscall_state.emulate_result(-errno);
         } else if (tracee->status().is_syscall()) {
           tracee->emulate_ptrace_stop(tracee->status(), SYSCALL_EXIT_STOP);
         } else if (tracee->emulated_stop_pending == NOT_STOPPED) {
@@ -6228,7 +6229,7 @@ static string handle_opened_file(RecordTask* t, int fd, int flags) {
 
   // This must be kept in sync with replay_syscall's handle_opened_files.
   FileMonitor* file_monitor = nullptr;
-  if (is_mapped_shared(t, st) && is_writable(t, fd)) {
+  if (is_writable(t, fd) && is_mapped_shared(t, st)) {
     // This is quite subtle. Because open(2) is ALLOW_SWITCH, we could have been
     // descheduled after entering the syscall we're now exiting. If that happened,
     // and another task did a shared mapping of this file while we were suspended,
@@ -6393,9 +6394,15 @@ static void rec_process_syscall_arch(RecordTask* t,
   // syscall completes --- and that our TaskSyscallState infrastructure can't
   // handle.
   switch (syscallno) {
-    case Arch::fork:
     case Arch::vfork:
-    case Arch::clone: {
+    case Arch::fork:
+    case Arch::clone:
+      if ((syscallno == Arch::vfork ||
+           (syscallno == Arch::clone && (t->regs().arg1() & CLONE_VFORK))) &&
+          (t->emulated_ptrace_options & PTRACE_O_TRACEVFORKDONE)) {
+        t->emulate_ptrace_stop(
+            WaitStatus::for_ptrace_event(PTRACE_EVENT_VFORK_DONE));
+      }
       if (Arch::is_x86ish()) {
         // On a 3.19.0-39-generic #44-Ubuntu kernel we have observed clone()
         // clearing the parity flag internally.
@@ -6404,7 +6411,6 @@ static void rec_process_syscall_arch(RecordTask* t,
         t->set_regs(r);
       }
       break;
-    }
 
     case Arch::execve:
     case Arch::execveat:
@@ -6825,7 +6831,7 @@ static void rec_process_syscall_arch(RecordTask* t,
             tracee = nullptr;
           }
         }
-        if (tracee && (tracee->waiting_for_reap || tracee->waiting_for_zombie)) {
+        if (tracee && tracee->already_exited()) {
           // Have another go at reaping the task
           tracee->did_reach_zombie();
         }

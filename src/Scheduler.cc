@@ -99,6 +99,7 @@ Scheduler::Scheduler(RecordSession& session)
       must_run_task(nullptr),
       pretend_num_cores_(1),
       in_exec_tgid(0),
+      ntasks_stopped(0),
       always_switch(false),
       enable_chaos(false),
       enable_poll(false),
@@ -208,10 +209,6 @@ private:
 };
 
 bool WaitAggregator::try_wait(RecordTask* t) {
-  if (t->wait_unexpected_exit()) {
-    return true;
-  }
-
   if (!did_poll_stops) {
     if (num_waits_before_polling_stops > 0) {
       --num_waits_before_polling_stops;
@@ -249,8 +246,7 @@ bool WaitAggregator::try_wait_exit(RecordTask* t) {
   WaitResult result = WaitManager::wait_exit(options);
   switch (result.code) {
     case WAIT_OK:
-      LOGM(debug) << "Synthesizing PTRACE_EVENT_EXIT for zombie process in try_wait " << t->tid;
-      t->did_waitpid(WaitStatus::for_ptrace_event(PTRACE_EVENT_EXIT));
+      t->did_waitpid(result.status);
       return true;
     case WAIT_NO_STATUS:
       // This can happen when the task is in zap_pid_ns_processes waiting for all tasks
@@ -289,7 +285,6 @@ bool Scheduler::is_task_runnable(RecordTask* t, WaitAggregator& wait_aggregator,
     return false;
   }
 
-
   LOGM(debug) << "Task event is " << t->ev();
   if (!t->may_be_blocked()) {
     LOGM(debug) << "  " << t->tid << " isn't blocked";
@@ -298,11 +293,6 @@ bool Scheduler::is_task_runnable(RecordTask* t, WaitAggregator& wait_aggregator,
       return false;
     }
     return true;
-  }
-
-  if (t->waiting_for_zombie) {
-    LOGM(debug) << "  " << t->tid << " is waiting to become a zombie";
-    return false;
   }
 
   if (t->emulated_stop_type != NOT_STOPPED) {
@@ -328,13 +318,13 @@ bool Scheduler::is_task_runnable(RecordTask* t, WaitAggregator& wait_aggregator,
       WaitAggregator::try_wait_exit(t);
       // N.B.: If we supported ptrace exit notifications for killed tracee's
       // that would need handling here, but we don't at the moment.
-      return t->is_dying();
+      return t->seen_ptrace_exit_event();
     }
   }
 
   if (t->waiting_for_ptrace_exit) {
     LOGM(debug) << "  " << t->tid << " is waiting to exit; checking status ...";
-  } else if (!t->is_running()) {
+  } else if (t->is_stopped() || t->was_reaped()) {
     LOGM(debug) << "  " << t->tid << "  was already stopped with status " << t->status();
     if (t->schedule_frozen && t->status().ptrace_event() != PTRACE_EVENT_SECCOMP) {
       LOGM(debug) << "   but is frozen";
@@ -357,10 +347,10 @@ bool Scheduler::is_task_runnable(RecordTask* t, WaitAggregator& wait_aggregator,
     // the task is not stopped yet if we pass WNOHANG. To make them
     // behave predictably, do a blocking wait.
     t->wait();
-    ntasks_running--;
     *by_waitpid = true;
     must_run_task = t;
-    LOGM(debug) << "  sched_yield ready with status " << t->status();
+    LOGM(debug) << "  " << syscall_name(t->ev().Syscall().number, t->arch())
+      << " ready with status " << t->status();
     return true;
   } else {
     LOGM(debug) << "  " << t->tid << " is blocked on " << t->ev()
@@ -376,7 +366,6 @@ bool Scheduler::is_task_runnable(RecordTask* t, WaitAggregator& wait_aggregator,
       return false;
     }
     *by_waitpid = true;
-    ntasks_running--;
     must_run_task = t;
     return true;
   }
@@ -531,7 +520,7 @@ void Scheduler::validate_scheduled_task() {
  * and `tid` and `status` are valid, or false if the wait was interrupted
  * (by timeout or some other signal).
  */
-static bool wait_any(pid_t& tid, WaitStatus& status, double timeout) {
+static WaitResultCode wait_any(pid_t& tid, WaitStatus& status, double timeout) {
   WaitOptions options;
   if (timeout > 0) {
     options.block_seconds = timeout;
@@ -541,21 +530,18 @@ static bool wait_any(pid_t& tid, WaitStatus& status, double timeout) {
     case WAIT_OK:
       tid = result.tid;
       status = result.status;
-      return true;
+      break;
     case WAIT_NO_STATUS:
       LOGM(debug) << "  wait interrupted";
-      return false;
+      break;
     case WAIT_NO_CHILD:
-      // It's possible that the original thread group was detached,
-      // and the only thing left we were waiting for, in which case we
-      // get ECHILD here. Just abort this record step, so the caller
-      // can end the record session.
-      return false;
+      LOGM(debug) << "  no child to wait for";
+      break;
     default:
       FATAL() << "Unknown result code";
-      return false;
+      break;
   }
-  return true;
+  return result.code;
 }
 
 /**
@@ -644,7 +630,24 @@ static RecordTask* find_waited_task(RecordSession& session, pid_t tid, WaitStatu
 }
 
 bool Scheduler::may_use_unlimited_ticks() {
-  return ntasks_running == session.tasks().size() - 1;
+  return ntasks_stopped == 1;
+}
+
+void Scheduler::started_task(RecordTask* t) {
+  LOGM(debug) << "Starting " << t->tid;
+  if (may_use_unlimited_ticks()) {
+    unlimited_ticks_mode = true;
+  }
+  --ntasks_stopped;
+  ASSERT(t, ntasks_stopped >= 0);
+}
+
+void Scheduler::stopped_task(RecordTask* t) {
+  LOGM(debug) << "Stopping " << t->tid;
+  ++ntasks_stopped;
+  // When a task is created/cloned it temporarily can be stopped
+  // but not in our task set.
+  ASSERT(t, ntasks_stopped <= static_cast<int>(session.tasks().size()) + 1);
 }
 
 Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
@@ -667,7 +670,7 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
   if (current_ && switchable == PREVENT_SWITCH) {
     LOGM(debug) << "  (" << current_->tid << " is un-switchable at "
                << current_->ev() << ")";
-    if (current_->is_running()) {
+    if (!current_->is_stopped()) {
       /* |current| is un-switchable, but already running. Wait for it to change
       * state before "scheduling it", so avoid busy-waiting with our client. */
       LOGM(debug) << "  and running; waiting for state change";
@@ -679,20 +682,21 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
           // tracer. However, this does mean we need to be on the look out for
           // other tasks becoming runnable, which we usually check on timeslice
           // expiration.
-          ASSERT(current_, ntasks_running == session.tasks().size());
+          ASSERT(current_, !ntasks_stopped);
           pid_t tid;
           WaitStatus status;
-          if (!wait_any(tid, status, -1)) {
+          WaitResultCode wait_result = wait_any(tid, status, -1);
+          if (wait_result == WAIT_NO_STATUS) {
             ASSERT(current_, !must_run_task);
             result.interrupted_by_signal = true;
             return result;
           }
+          ASSERT(current_, wait_result == WAIT_OK);
           RecordTask *waited = find_waited_task(session, tid, status);
           if (!waited) {
             continue;
           }
           waited->did_waitpid(status);
-          ntasks_running--;
           // Another task just became runnable, we're no longer in unlimited
           // ticks mode
           unlimited_ticks_mode = false;
@@ -711,7 +715,6 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
           LOGM(debug) << "  But that's not our current task...";
         } else {
           current_->wait(timeout);
-          ntasks_running--;
           break;
         }
       }
@@ -864,9 +867,19 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
     do {
       double timeout = enable_poll ? 1 : 0;
       pid_t tid;
-      if (!wait_any(tid, status, timeout)) {
-        ASSERT(current_, !must_run_task);
+      WaitResultCode wait_result = wait_any(tid, status, timeout);
+      if (wait_result == WAIT_NO_STATUS) {
+        if (must_run_task) {
+          FATAL() << "must_run_task but no status?";
+        }
         result.interrupted_by_signal = true;
+        return result;
+      }
+      if (wait_result == WAIT_NO_CHILD) {
+        // It's possible that the original thread group was detached,
+        // and the only thing left we were waiting for, in which case we
+        // get ECHILD here. Just abort this record step, so the caller
+        // can end the record session.
         return result;
       }
       LOGM(debug) << "  " << tid << " changed status to " << status;
@@ -878,7 +891,6 @@ Scheduler::Rescheduled Scheduler::reschedule(Switchable switchable) {
                    status.ptrace_event() == PTRACE_EVENT_EXIT ||
                    status.reaped())
             << "Scheduled task should have been blocked";
-        ntasks_running--;
         next->did_waitpid(status);
         if (in_exec_tgid && next->tgid() != in_exec_tgid) {
           // Some threadgroup is doing execve and this task isn't in

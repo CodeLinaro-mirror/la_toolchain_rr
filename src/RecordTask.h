@@ -186,8 +186,12 @@ public:
    */
   bool is_waiting_for(RecordTask* t);
 
-  virtual bool already_exited() const override {
-    return waiting_for_reap || waiting_for_zombie;
+  bool already_exited() const override {
+    return waiting_for_reap;
+  }
+
+  bool is_detached_proxy() const override {
+    return detached_proxy;
   }
 
   /**
@@ -419,6 +423,13 @@ public:
   // exists
   bool record_remote_by_local_map(remote_ptr<void> addr, size_t num_bytes);
 
+  template <typename T>
+  void write_and_record(remote_ptr<T> addr, const T& value, bool* ok = nullptr,
+                        uint32_t flags = 0) {
+    write_mem(addr, value, ok, flags);
+    record_local(addr, &value, 1);
+  }
+
   /**
    * Save tracee data to the trace.  |addr| is the address in
    * the address space of this task.
@@ -625,6 +636,8 @@ public:
     robust_futex_list_len = len;
   }
 
+  void set_stopped(bool stopped) override;
+
 private:
   /* Retrieve the tid of this task from the tracee and store it */
   void update_own_namespace_tid();
@@ -794,9 +807,6 @@ public:
 
   // This task is just waiting to be reaped.
   bool waiting_for_reap;
-
-  // This task is waiting to reach zombie state
-  bool waiting_for_zombie;
 
   // This task is waiting for a ptrace exit event. It should not
   // be manually run.

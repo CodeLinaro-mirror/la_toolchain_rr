@@ -487,24 +487,29 @@ KernelMapping Session::create_shared_mmap(
   if (!required_child_addr.is_null()) {
     flags |= MAP_FIXED;
   }
-  KernelMapping km = t->vm()->map(
-      t, child_map_addr, size, tracee_prot, flags | tracee_flags, 0,
-      path, st.st_dev, st.st_ino, nullptr, nullptr, nullptr, map_addr,
-      std::move(monitored));
 
   int child_shmem_fd = remote.infallible_send_fd_if_alive(shmem_fd);
   if (child_shmem_fd < 0) {
-    return km;
+    return KernelMapping();
   }
   LOG(debug) << "created shmem segment " << path;
 
   // Map the segment in ours and the tracee's address spaces.
-  remote.infallible_mmap_syscall_if_alive(
+  remote_ptr<void> addr = remote.infallible_mmap_syscall_if_alive(
       child_map_addr, size, tracee_prot, flags | MAP_FIXED, child_shmem_fd, 0);
-  if (!child_map_addr) {
-    // tracee unexpectedly died
-    return km;
+  if (!addr) {
+    // tracee unexpectedly died.
+    // We leak the fd; cleaning it up is probably impossible/unnecessary.
+    return KernelMapping();
   }
+
+  // Note the mapping after we successfully created it in the child.
+  // If the child mapping fails for some reason (e.g. SIGKILL) we still
+  // want our cache to be correct (and not contain the mapping).
+  KernelMapping km = t->vm()->map(
+      t, child_map_addr, size, tracee_prot, flags | tracee_flags, 0,
+      path, st.st_dev, st.st_ino, nullptr, nullptr, nullptr, map_addr,
+      std::move(monitored));
 
   remote.infallible_close_syscall_if_alive(child_shmem_fd);
   return km;
@@ -572,7 +577,7 @@ const AddressSpace::Mapping Session::recreate_shared_mmap(
   return new_map;
 }
 
-const AddressSpace::Mapping& Session::steal_mapping(
+AddressSpace::Mapping Session::steal_mapping(
     AutoRemoteSyscalls& remote, const AddressSpace::Mapping& m,
     MonitoredSharedMemory::shr_ptr monitored) {
   // We will include the name of the full path of the original mapping in the
@@ -617,7 +622,7 @@ void Session::make_private_shared(AutoRemoteSyscalls& remote,
   // segment as it's scratch space, reevaluate that choice
   AutoRemoteSyscalls remote2(remote.task());
 
-  const AddressSpace::Mapping& new_m = steal_mapping(remote2, m);
+  AddressSpace::Mapping new_m = steal_mapping(remote2, m);
 
   if (!new_m.local_addr) {
     return;

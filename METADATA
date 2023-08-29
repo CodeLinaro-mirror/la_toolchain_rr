@@ -1,6 +1,6 @@
 # This project was upgraded with external_updater.
 # Usage: tools/external_updater/updater.sh update <absolute path to project>
-# For more info, check https://cs.android.com/android/platform/superproject/+/master:tools/external_updater/README.md
+# For more info, check https://cs.android.com/android/platform/superproject/+/main:tools/external_updater/README.md
 
 name: "rr"
 description: "Record and Replay Framework"
@@ -13,11 +13,11 @@ third_party {
     type: GIT
     value: "https://github.com/rr-debugger/rr"
   }
-  version: "32167ae8b4b2c66c4d81aa38873fbf4a11f12059"
+  version: "5ead785cfbb4c46c75324ef3caa6067c70f3e3a6"
   license_type: NOTICE
   last_upgrade_date {
     year: 2023
-    month: 5
-    day: 23
+    month: 8
+    day: 29
   }
 }

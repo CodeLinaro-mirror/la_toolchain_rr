@@ -306,6 +306,8 @@ void AutoRemoteSyscalls::restore_state_to(Task* t) {
     // needs to be able to interrupt re-startable system calls, it is required
     // to set TIF_SIGPENDING, but the fact that this works is of course a very
     // deep implementation detail.
+    // If this fails then the tracee must be dead or no longer traced, in which
+    // case we no longer care about its TIF_SIGPENDING status.
     t->do_ptrace_interrupt();
   }
 }
@@ -327,10 +329,12 @@ static bool ignore_signal(Task* t) {
     return true;
   }
   siginfo_t siginfo;
-  if (t->ptrace_if_alive(PTRACE_GETSIGINFO, nullptr, &siginfo)) {
-    ASSERT(t, false) << "Unexpected signal " << siginfo;
-  } else {
+  errno = 0;
+  t->fallible_ptrace(PTRACE_GETSIGINFO, nullptr, &siginfo);
+  if (errno) {
     ASSERT(t, false) << "Unexpected signal " << signal_name(sig);
+  } else {
+    ASSERT(t, false) << "Unexpected signal " << siginfo;
   }
   return false;
 }
@@ -338,7 +342,7 @@ static bool ignore_signal(Task* t) {
 long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
   LOG(debug) << "syscall " << syscall_name(syscallno, t->arch()) << " " << callregs;
 
-  if (t->is_dying()) {
+  if (t->seen_ptrace_exit_event()) {
     LOG(debug) << "Task is dying, don't try anything.";
     return -ESRCH;
   }
@@ -400,9 +404,10 @@ long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
   }
   while (true) {
     // If the syscall caused the task to exit, just stop now with that status.
-    if (t->ptrace_event() == PTRACE_EVENT_EXIT) {
+    if (t->seen_ptrace_exit_event() || t->status().reaped()) {
       restore_wait_status = t->status();
-      break;
+      LOG(debug) << "Task is dying, no status result";
+      return -ESRCH;
     }
     if (t->status().is_syscall() ||
         (t->stop_sig() == SIGTRAP &&
@@ -438,13 +443,8 @@ long AutoRemoteSyscalls::syscall_base(int syscallno, Registers& callregs) {
     break;
   }
 
-  if (t->is_dying()) {
-    LOG(debug) << "Task is dying, no status result";
-    return -ESRCH;
-  } else {
-    LOG(debug) << "done, result=" << t->regs().syscall_result();
-    return t->regs().syscall_result();
-  }
+  LOG(debug) << "done, result=" << t->regs().syscall_result();
+  return t->regs().syscall_result();
 }
 
 SupportedArch AutoRemoteSyscalls::arch() const { return t->arch(); }
@@ -632,7 +632,7 @@ static void sendmsg_socket(ScopedFd& sock, int fd_to_send)
 
 static Task* thread_group_leader_for_fds(Task* t) {
   for (Task* tt : t->fd_table()->task_set()) {
-    if (tt->tgid() == tt->rec_tid) {
+    if (tt->tgid() == tt->rec_tid && !tt->seen_ptrace_exit_event()) {
       return tt;
     }
   }
@@ -641,8 +641,9 @@ static Task* thread_group_leader_for_fds(Task* t) {
 
 template <typename Arch> ScopedFd AutoRemoteSyscalls::retrieve_fd_arch(int fd) {
   ScopedFd ret;
-  // Try to use pidfd_getfd to get the fd without round-tripping to the tracee
   if (!pid_fd.is_open()) {
+    // Try to use pidfd_getfd to get the fd without round-tripping to the tracee.
+    // pidfd_getfd requires a threadgroup leader, so find one if we can.
     Task* tg_leader_for_fds = thread_group_leader_for_fds(t);
     if (tg_leader_for_fds) {
       pid_fd = ScopedFd(::syscall(NativeArch::pidfd_open, tg_leader_for_fds->tid, 0));
@@ -744,10 +745,38 @@ remote_ptr<void> AutoRemoteSyscalls::infallible_mmap_syscall_if_alive(
           : infallible_syscall_ptr_if_alive(syscall_number_for_mmap(arch()), addr,
                                             length, prot, flags, child_fd,
                                             offset_bytes);
-  if (ret && (flags & MAP_FIXED)) {
-    ASSERT(t, addr == ret) << "MAP_FIXED at " << addr << " but got " << ret;
+  if (flags & MAP_FIXED) {
+    if (ret) {
+      ASSERT(t, addr == ret) << "MAP_FIXED at " << addr << " but got " << ret;
+    } else {
+      if (!t->vm()->has_mapping(addr)) {
+        KernelMapping km = t->vm()->read_kernel_mapping(t, addr);
+        if (km.size()) {
+          ASSERT(t, km.start() == addr && km.size() == ceil_page_size(length));
+          // The mapping was created. Pretend this call succeeded.
+          ret = addr;
+        }
+      }
+    }
   }
   return ret;
+}
+
+bool AutoRemoteSyscalls::infallible_munmap_syscall_if_alive(
+    remote_ptr<void> addr, size_t length) {
+  long ret = infallible_syscall_if_alive(syscall_number_for_munmap(arch()),
+                                         addr, length);
+  if (ret) {
+    if (t->vm()->has_mapping(addr)) {
+      KernelMapping km = t->vm()->read_kernel_mapping(t, addr);
+      if (!km.size()) {
+        // The unmap happened but the task must have died before
+        // reporting the status.
+        ret = 0;
+      }
+    }
+  }
+  return !ret;
 }
 
 int64_t AutoRemoteSyscalls::infallible_lseek_syscall(int fd, int64_t offset,
@@ -783,6 +812,9 @@ void AutoRemoteSyscalls::check_syscall_result(long ret, int syscallno, bool allo
       extra_msg = " opening " + t->read_c_str(t->regs().arg1());
     } else if (is_openat_syscall(syscallno, arch())) {
       extra_msg = " opening " + t->read_c_str(t->regs().arg2());
+    } else if (is_mremap_syscall(syscallno, arch()) ||
+               is_mmap_syscall(syscallno, arch())) {
+      AddressSpace::print_process_maps(t);
     }
     ASSERT(t, false) << "Syscall " << syscall_name(syscallno, arch())
                      << " failed with errno " << errno_name(-ret) << extra_msg

@@ -37,6 +37,7 @@
 #include "CPUIDBugDetector.h"
 #include "Flags.h"
 #include "MagicSaveDataMonitor.h"
+#include "PidFdMonitor.h"
 #include "PreserveFileMonitor.h"
 #include "ProcMemMonitor.h"
 #include "RecordSession.h"
@@ -88,19 +89,18 @@ Task::Task(Session& session, pid_t _tid, pid_t _rec_tid, uint32_t serial,
       how_last_execution_resumed(RESUME_CONT),
       last_resume_orig_cx(0),
       did_set_breakpoint_after_cpuid(false),
-      is_stopped(false),
+      is_stopped_(false),
       seccomp_bpf_enabled(false),
-      detected_unexpected_exit(false),
       registers_dirty(false),
       orig_syscallno_dirty(false),
       extra_registers(a),
       extra_registers_known(false),
       session_(&session),
       top_of_stack(),
-      seen_ptrace_exit_event(false),
-      handled_ptrace_exit_event(false),
+      seen_ptrace_exit_event_(false),
+      handled_ptrace_exit_event_(false),
       expecting_ptrace_interrupt_stop(0),
-      was_reaped(false),
+      was_reaped_(false),
       forgotten(false) {
   memset(&thread_locals, 0, sizeof(thread_locals));
 }
@@ -112,7 +112,7 @@ void Task::detach() {
 
   // Not really, but there's also no reason to actually try to reap it,
   // since we detached.
-  was_reaped = true;
+  was_reaped_ = true;
 }
 
 void Task::reenable_cpuid_tsc() {
@@ -152,12 +152,12 @@ void Task::wait_exit() {
         // case we're only now catching up to the real process exit. In that
         // case, just ask the process to actually exit. (TODO: We may want to
         // catch this earlier).
-        return proceed_to_exit(true);
+        return proceed_to_exit();
       }
       ASSERT(this, result.status.ptrace_event() == PTRACE_EVENT_EXEC)
         << "Expected PTRACE_EVENT_EXEC, got " << result.status;
       // The kernel will do the reaping for us in this case
-      was_reaped = true;
+      was_reaped_ = true;
     } else if (result.code == WAIT_NO_STATUS) {
       // Wait was EINTR'd most likely - retry.
       continue;
@@ -178,7 +178,7 @@ void Task::proceed_to_exit(bool wait) {
 }
 
 WaitStatus Task::kill() {
-  if (already_reaped()) {
+  if (was_reaped()) {
     return this->status();
   }
   /* This call is racy. There is basically three situations:
@@ -218,9 +218,10 @@ WaitStatus Task::kill() {
       * which implicitly detached.
       */
     unsigned long long_status;
-    if (ptrace_if_alive(PTRACE_GETEVENTMSG, nullptr, &long_status)) {
+    if (ptrace_if_stopped(PTRACE_GETEVENTMSG, nullptr, &long_status)) {
       status = WaitStatus(long_status);
     } else {
+      // The task has been killed due to SIGKILL or equivalent.
       status = WaitStatus::for_fatal_sig(SIGKILL);
     }
     int ret = fallible_ptrace(PTRACE_DETACH, nullptr, nullptr);
@@ -240,18 +241,17 @@ WaitStatus Task::kill() {
       status = result.status;
     }
   } else {
-    was_reaped = true;
+    was_reaped_ = true;
   }
   return status;
 }
 
 Task::~Task() {
   if (!forgotten) {
-    ASSERT(this, seen_ptrace_exit_event);
-    ASSERT(this, handled_ptrace_exit_event);
+    ASSERT(this, handled_ptrace_exit_event_);
     ASSERT(this, syscallbuf_child.is_null());
 
-    if (!session().is_recording() && !already_reaped()) {
+    if (!session().is_recording() && !was_reaped()) {
       // Reap the zombie.
       WaitResult result = WaitManager::wait_exit(WaitOptions(tid));
       ASSERT(this, result.code == WAIT_OK || result.code == WAIT_NO_CHILD);
@@ -394,6 +394,14 @@ string Task::file_name_of_fd(int fd) {
   return path;
 }
 
+pid_t Task::get_ptrace_eventmsg_pid() {
+  unsigned long msg = 0;
+  if (!ptrace_if_stopped(PTRACE_GETEVENTMSG, nullptr, &msg)) {
+    return -1;
+  }
+  return msg;
+}
+
 const siginfo_t& Task::get_siginfo() {
   DEBUG_ASSERT(stop_sig());
   return pending_siginfo;
@@ -428,16 +436,17 @@ done:
 void Task::unmap_buffers_for(
     AutoRemoteSyscalls& remote, Task* other,
     remote_ptr<struct syscallbuf_hdr> saved_syscallbuf_child) {
-  auto arch = remote.task()->arch();
   if (other->scratch_ptr) {
-    remote.infallible_syscall(syscall_number_for_munmap(arch),
-                              other->scratch_ptr, other->scratch_size);
-    vm()->unmap(this, other->scratch_ptr, other->scratch_size);
+    if (remote.infallible_munmap_syscall_if_alive(
+          other->scratch_ptr, other->scratch_size)) {
+      vm()->unmap(this, other->scratch_ptr, other->scratch_size);
+    }
   }
   if (!saved_syscallbuf_child.is_null()) {
-    remote.infallible_syscall(syscall_number_for_munmap(arch),
-                              saved_syscallbuf_child, other->syscallbuf_size);
-    vm()->unmap(this, saved_syscallbuf_child, other->syscallbuf_size);
+    if (remote.infallible_munmap_syscall_if_alive(
+          saved_syscallbuf_child, other->syscallbuf_size)) {
+      vm()->unmap(this, saved_syscallbuf_child, other->syscallbuf_size);
+    }
   }
 }
 
@@ -447,8 +456,8 @@ void Task::did_kill()
    * in Session.cc), but let's pretend that we did to make this task look like
    * other that we didn't kill ourselves
    */
-  seen_ptrace_exit_event = true;
-  handled_ptrace_exit_event = true;
+  seen_ptrace_exit_event_ = true;
+  handled_ptrace_exit_event_ = true;
   syscallbuf_child = nullptr;
   /* No need to unmap/close things in the child here - the kernel did that for
    * us when the child died. */
@@ -805,7 +814,9 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
               if (regs.arg3() == 0) {
                 // Work around a kernel bug in pre-4.7 kernels, where setting
                 // the gs/fs base to 0 via PTRACE_REGSET did not work correctly.
-                tracee->ptrace_if_alive(Arch::PTRACE_ARCH_PRCTL, regs.arg3(),
+                // If this fails the tracee is on the exit path and it
+                // doesn't matter what its fs/gs base is.
+                tracee->ptrace_if_stopped(Arch::PTRACE_ARCH_PRCTL, regs.arg3(),
                                         (void*)(uintptr_t)regs.arg4());
               }
               if (code == ARCH_SET_FS) {
@@ -827,6 +838,30 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
         case Arch::PTRACE_POKEUSR: {
           ptrace_syscall_exit_legacy_arch<Arch>(this, tracee, regs);
         }
+      }
+      return;
+    }
+    case Arch::pidfd_open: {
+      int fd = regs.syscall_result();
+      pid_t pid = (pid_t)regs.orig_arg1();
+      TaskUid tuid;
+      if (Task* t = session().find_task(pid)) {
+        tuid = t->tuid();
+      }
+      fd_table()->add_monitor(this, fd, new PidFdMonitor(tuid));
+      return;
+    }
+    case Arch::pidfd_getfd: {
+      int pidfd = regs.orig_arg1();
+      int fd = regs.arg2();
+      if (PidFdMonitor* monitor = PidFdMonitor::get(fd_table().get(), pidfd)) {
+        // NB: This can return NULL if the pidfd is for a process outside of
+        // the rr trace.
+        if (auto source = monitor->fd_table(session())) {
+          fd_table()->did_dup(source.get(), fd, regs.syscall_result());
+        }
+      } else {
+        LOG(warn) << "pidfd_getfd succeeded but we lost track of the pidfd " << pidfd;
       }
       return;
     }
@@ -966,7 +1001,7 @@ void Task::post_exec(const string& exe_file) {
   for (Task* t : as->task_set()) {
     if (t != this) {
       other_task_in_address_space = true;
-      if (t->is_stopped) {
+      if (t->is_stopped_) {
         stopped_task_in_address_space = t;
         break;
       }
@@ -1061,7 +1096,7 @@ string Task::read_c_str(remote_ptr<char> child_addr, bool *ok) {
 }
 
 const Registers& Task::regs() const {
-  ASSERT(this, is_stopped);
+  ASSERT(this, is_stopped_ || was_reaped_);
   return registers;
 }
 
@@ -1463,14 +1498,14 @@ void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
   }
 
   bool detected_exit = false;
-  if (session().is_recording() && !is_dying()) {
+  if (session().is_recording() && !seen_ptrace_exit_event()) {
     /* There's a nasty race where a stopped task gets woken up by a SIGKILL
      * and advances to the PTRACE_EXIT_EVENT ptrace-stop just before we
      * send a PTRACE_CONT. Our PTRACE_CONT will cause it to continue and exit,
      * which means we don't get a chance to clean up robust futexes etc.
      * Avoid that by doing a waitpid() here to see if it has exited.
      * This doesn't fully close the race since in theory we could be preempted
-     * between the waitpid and the ptrace_if_alive, giving another task
+     * between the waitpid and the ptrace_if_stopped, giving another task
      * a chance to SIGKILL our tracee and advance it to the PTRACE_EXIT_EVENT,
      * or just letting the tracee be scheduled to process its pending SIGKILL.
      */
@@ -1493,14 +1528,15 @@ void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
       detected_exit = true;
     }
   }
-  if (detected_exit || is_dying()) {
+  if (detected_exit) {
     LOG(debug) << "Task " << tid << " exited unexpectedly";
-    // wait() will see this and report the ptrace-exit event.
-    detected_unexpected_exit = true;
   } else {
     ASSERT(this, setup_succeeded);
-    ptrace_if_alive(how, nullptr, (void*)(uintptr_t)sig);
-    is_stopped = false;
+    ptrace_if_stopped(how, nullptr, (void*)(uintptr_t)sig);
+    // If ptrace_if_stopped failed, it means we're running along the
+    // exit path due to a SIGKILL or equivalent, so just like if it
+    // succeeded, we are stopped and will receive a wait notification.
+    set_stopped(false);
     extra_registers_known = false;
     if (RESUME_WAIT == wait_how) {
       wait();
@@ -1509,7 +1545,7 @@ void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
 }
 
 void Task::set_regs(const Registers& regs) {
-  ASSERT(this, is_stopped);
+  ASSERT(this, is_stopped_);
   if (registers.original_syscallno() != regs.original_syscallno()) {
     orig_syscallno_dirty = true;
   }
@@ -1525,15 +1561,16 @@ void Task::flush_regs() {
     LOG(debug) << "Flushing registers for tid " << tid << " " << registers;
     auto ptrace_regs = registers.get_ptrace_iovec();
 #if defined(__i386__) || defined(__x86_64__)
-    if (ptrace_if_alive(PTRACE_SETREGSET, NT_PRSTATUS, &ptrace_regs)) {
-      /* It's ok for flush regs to fail, e.g. if the task got killed underneath
-       * us - we just need to remember not to trust any value we would load
-       * from ptrace otherwise */
+    if (ptrace_if_stopped(PTRACE_SETREGSET, NT_PRSTATUS, &ptrace_regs)) {
+      /* If that failed, the task was killed and it should not matter what
+         we tried to set. But we will remember that our registers are dirty. */
       registers_dirty = false;
       orig_syscallno_dirty = false;
     }
 #elif defined(__aarch64__)
-    if (ptrace_if_alive(PTRACE_SETREGSET, NT_PRSTATUS, &ptrace_regs)) {
+    if (ptrace_if_stopped(PTRACE_SETREGSET, NT_PRSTATUS, &ptrace_regs)) {
+      /* If that failed, the task was killed and it should not matter what
+         we tried to set. But we will remember that our registers are dirty. */
       registers_dirty = false;
     }
 #else
@@ -1550,7 +1587,9 @@ void Task::flush_regs() {
     struct iovec vec = { &syscall,
                           sizeof(syscall) };
     LOG(debug) << "Changing syscall to " << syscall;
-    if (ptrace_if_alive(PTRACE_SETREGSET, NT_ARM_SYSTEM_CALL, &vec)) {
+    if (ptrace_if_stopped(PTRACE_SETREGSET, NT_ARM_SYSTEM_CALL, &vec)) {
+      /* If that failed, the task was killed and it should not matter what
+         we tried to set. But we will remember that our registers are dirty. */
       orig_syscallno_dirty = false;
     }
   }
@@ -1562,25 +1601,36 @@ void Task::set_extra_regs(const ExtraRegisters& regs) {
   ASSERT(this, regs.arch() == arch())
       << "Trying to set wrong arch ExtraRegisters";
   extra_registers = regs;
-  extra_registers_known = true;
 
   switch (extra_registers.format()) {
     case ExtraRegisters::XSAVE: {
       if (xsave_area_size() > 512) {
         struct iovec vec = { extra_registers.data_.data(),
                              extra_registers.data_.size() };
-        ptrace_if_alive(PTRACE_SETREGSET, NT_X86_XSTATE, &vec);
+        if (ptrace_if_stopped(PTRACE_SETREGSET, NT_X86_XSTATE, &vec)) {
+          /* If that failed, the task was killed and it should not matter what
+             we tried to set. But we will remember that our registers are dirty. */
+          extra_registers_known = true;
+        }
       } else {
 #if defined(__i386__)
         ASSERT(this,
                extra_registers.data_.size() == sizeof(user_fpxregs_struct));
-        ptrace_if_alive(X86Arch::PTRACE_SETFPXREGS, nullptr,
-                        extra_registers.data_.data());
+        if (ptrace_if_stopped(X86Arch::PTRACE_SETFPXREGS, nullptr,
+                              extra_registers.data_.data())) {
+          /* If that failed, the task was killed and it should not matter what
+             we tried to set. But we will remember that our registers are dirty. */
+          extra_registers_known = true;
+        }
 #elif defined(__x86_64__)
         ASSERT(this,
                extra_registers.data_.size() == sizeof(user_fpregs_struct));
-        ptrace_if_alive(PTRACE_SETFPREGS, nullptr,
-                        extra_registers.data_.data());
+        if (ptrace_if_stopped(PTRACE_SETFPREGS, nullptr,
+                              extra_registers.data_.data())) {
+          /* If that failed, the task was killed and it should not matter what
+             we tried to set. But we will remember that our registers are dirty. */
+          extra_registers_known = true;
+        }
 #endif
       }
       break;
@@ -1588,7 +1638,11 @@ void Task::set_extra_regs(const ExtraRegisters& regs) {
     case ExtraRegisters::NT_FPR: {
       struct iovec vec = { extra_registers.data_.data(),
                             extra_registers.data_.size() };
-      ptrace_if_alive(PTRACE_SETREGSET, NT_PRFPREG, &vec);
+      if (ptrace_if_stopped(PTRACE_SETREGSET, NT_PRFPREG, &vec)) {
+        /* If that failed, the task was killed and it should not matter what
+           we tried to set. But we will remember that our registers are dirty. */
+        extra_registers_known = true;
+      }
       break;
     }
     default:
@@ -1886,19 +1940,15 @@ static bool is_signal_triggered_by_ptrace_interrupt(int group_stop_sig) {
 // waitpid to return EINTR and that's all we need.
 static void handle_alarm_signal(__attribute__((unused)) int sig) {}
 
-bool Task::wait_unexpected_exit() {
-  if (detected_unexpected_exit) {
-    LOG(debug) << "Unexpected (SIGKILL) exit was detected; reporting it now";
-    did_waitpid(WaitStatus::for_ptrace_event(PTRACE_EVENT_EXIT));
-    detected_unexpected_exit = false;
-    return true;
+bool Task::do_ptrace_interrupt() {
+  errno = 0;
+  fallible_ptrace(PTRACE_INTERRUPT, nullptr, nullptr);
+  if (errno) {
+    ASSERT(this, errno == ESRCH) << "Unexpected PTRACE_INTERRUPT error " << errno;
+    return false;
   }
-  return false;
-}
-
-void Task::do_ptrace_interrupt() {
-  ptrace_if_alive(PTRACE_INTERRUPT, nullptr, nullptr);
   expecting_ptrace_interrupt_stop = 2;
+  return true;
 }
 
 bool Task::account_for_potential_ptrace_interrupt_stop(WaitStatus status) {
@@ -1916,14 +1966,12 @@ void Task::wait(double interrupt_after_elapsed) {
   LOG(debug) << "going into blocking wait for " << tid << " ...";
   ASSERT(this, session().is_recording() || interrupt_after_elapsed == -1);
 
-  if (wait_unexpected_exit()) {
-    return;
-  }
-
   bool sent_wait_interrupt = false;
   WaitResult result;
   while (true) {
     if (interrupt_after_elapsed == 0 && !sent_wait_interrupt) {
+      // If this fails, the tracee must be a zombie or altogether gone,
+      // in which case we should detect that status change later.
       do_ptrace_interrupt();
       if (session().is_recording()) {
         // Force this timeslice to end
@@ -1966,7 +2014,7 @@ void Task::wait(double interrupt_after_elapsed) {
 }
 
 void Task::canonicalize_regs(SupportedArch syscall_arch) {
-  ASSERT(this, is_stopped);
+  ASSERT(this, is_stopped_);
 
   if (registers.arch() == x86_64) {
     if (syscall_arch == x86) {
@@ -2029,59 +2077,32 @@ void Task::canonicalize_regs(SupportedArch syscall_arch) {
 
 bool Task::read_aarch64_tls_register(uintptr_t *result) {
   struct iovec vec = { result, sizeof(*result) };
-  return ptrace_if_alive(PTRACE_GETREGSET, NT_ARM_TLS, &vec);
+  return ptrace_if_stopped(PTRACE_GETREGSET, NT_ARM_TLS, &vec);
 }
 
 void Task::set_aarch64_tls_register(uintptr_t val) {
   struct iovec vec = { &val, sizeof(val) };
-  bool ok = ptrace_if_alive(PTRACE_SETREGSET, NT_ARM_TLS, &vec);
-  ASSERT(this, ok);
+  ptrace_if_stopped(PTRACE_SETREGSET, NT_ARM_TLS, &vec);
+  /* If that failed, the task was killed and it should not matter what
+     we tried to set. */
 }
 
 void Task::did_waitpid(WaitStatus status) {
+  if (is_detached_proxy() &&
+      (status.stop_sig() == SIGSTOP || status.stop_sig() == SIGCONT)) {
+    LOG(debug) << "Task " << tid << " is a detached proxy, ignoring status " << status;
+    return;
+  }
+
   LOG(debug) << "  Task " << tid << " changed status to " << status;
-
-  // After PTRACE_INTERRUPT, any next two stops may be a group stop caused by
-  // that PTRACE_INTERRUPT (or neither may be). This is because PTRACE_INTERRUPT
-  // generally lets other stops win (and thus doesn't inject it's own stop), but
-  // if the other stop was already done processing, even we didn't see it yet,
-  // the stop will still be queued, so we could see the other stop and then the
-  // PTRACE_INTERRUPT group stop.
-  // When we issue PTRACE_INTERRUPT, we this set this counter to 2, and here
-  // we decrement it on every stop such that while this counter is positive,
-  // any group-stop could be one induced by PTRACE_INTERRUPT
-  bool siginfo_overridden = false;
-  if (account_for_potential_ptrace_interrupt_stop(status)) {
-    // Assume this was PTRACE_INTERRUPT and thus treat this as
-    // TIME_SLICE_SIGNAL instead.
-    status = WaitStatus::for_stop_sig(PerfCounters::TIME_SLICE_SIGNAL);
-    memset(&pending_siginfo, 0, sizeof(pending_siginfo));
-    pending_siginfo.si_signo = PerfCounters::TIME_SLICE_SIGNAL;
-    pending_siginfo.si_fd = hpc.ticks_interrupt_fd();
-    pending_siginfo.si_code = POLL_IN;
-    siginfo_overridden = true;
-  }
-
-  if (!siginfo_overridden && status.stop_sig()) {
-    if (!ptrace_if_alive(PTRACE_GETSIGINFO, nullptr, &pending_siginfo)) {
-      LOG(debug) << "Unexpected process death getting siginfo for " << tid;
-      status = WaitStatus::for_ptrace_event(PTRACE_EVENT_EXIT);
-    }
-  }
 
   intptr_t original_syscallno = registers.original_syscallno();
   LOG(debug) << "  (refreshing register cache)";
   Ticks more_ticks = 0;
 
-  bool was_stopped = is_stopped;
-  // Mark as stopped now. If we fail one of the ticks assertions below,
-  // the test-monitor (or user) might want to attach the emergency debugger,
-  // which needs to know that the tracee is stopped.
-  is_stopped = true;
-
   if (status.reaped()) {
-    was_reaped = true;
-    if (handled_ptrace_exit_event) {
+    was_reaped_ = true;
+    if (handled_ptrace_exit_event_) {
       LOG(debug) << "Reaped task late " << tid;
       // We did not reap this task when it exited, likely because it was a
       // thread group leader blocked on the exit of the other members of
@@ -2098,8 +2119,37 @@ void Task::did_waitpid(WaitStatus status) {
      *      seems hardly worth it.
      */
     destroy_buffers(nullptr, nullptr);
-    status = WaitStatus::for_ptrace_event(PTRACE_EVENT_EXIT);
   } else {
+    bool was_stopped = is_stopped_;
+    // Mark as stopped now. If we fail one of the ticks assertions below,
+    // the test-monitor (or user) might want to attach the emergency debugger,
+    // which needs to know that the tracee is stopped.
+    set_stopped(true);
+
+    // After PTRACE_INTERRUPT, any next two stops may be a group stop caused by
+    // that PTRACE_INTERRUPT (or neither may be). This is because PTRACE_INTERRUPT
+    // generally lets other stops win (and thus doesn't inject it's own stop), but
+    // if the other stop was already done processing, even we didn't see it yet,
+    // the stop will still be queued, so we could see the other stop and then the
+    // PTRACE_INTERRUPT group stop.
+    // When we issue PTRACE_INTERRUPT, we this set this counter to 2, and here
+    // we decrement it on every stop such that while this counter is positive,
+    // any group-stop could be one induced by PTRACE_INTERRUPT
+    if (account_for_potential_ptrace_interrupt_stop(status)) {
+      // Assume this was PTRACE_INTERRUPT and thus treat this as
+      // TIME_SLICE_SIGNAL instead.
+      status = WaitStatus::for_stop_sig(PerfCounters::TIME_SLICE_SIGNAL);
+      memset(&pending_siginfo, 0, sizeof(pending_siginfo));
+      pending_siginfo.si_signo = PerfCounters::TIME_SLICE_SIGNAL;
+      pending_siginfo.si_fd = hpc.ticks_interrupt_fd();
+      pending_siginfo.si_code = POLL_IN;
+    } else if (status.stop_sig()) {
+      if (!ptrace_if_stopped(PTRACE_GETSIGINFO, nullptr, &pending_siginfo)) {
+        LOG(debug) << "Unexpected process death getting siginfo for " << tid;
+        status = WaitStatus::for_ptrace_event(PTRACE_EVENT_EXIT);
+      }
+    }
+
     // An unstable exit can cause a task to exit without us having run it, in
     // which case we might have pending register changes for it that are now
     // irrelevant. In that case we just throw away our register changes and use
@@ -2116,7 +2166,7 @@ void Task::did_waitpid(WaitStatus status) {
       NativeArch::user_regs_struct ptrace_regs;
 
 #if defined(__i386__) || defined(__x86_64__)
-      if (ptrace_if_alive(PTRACE_GETREGS, nullptr, &ptrace_regs)) {
+      if (ptrace_if_stopped(PTRACE_GETREGS, nullptr, &ptrace_regs)) {
         registers.set_from_ptrace(ptrace_regs);
         // Check the architecture of the task by looking at the
         // cs segment register and checking if that segment is a long mode segment
@@ -2142,7 +2192,7 @@ void Task::did_waitpid(WaitStatus status) {
 #elif defined(__aarch64__)
       struct iovec vec = { &ptrace_regs,
                           sizeof(ptrace_regs) };
-      if (ptrace_if_alive(PTRACE_GETREGSET, NT_PRSTATUS, &vec)) {
+      if (ptrace_if_stopped(PTRACE_GETREGSET, NT_PRSTATUS, &vec)) {
         registers.set_from_ptrace(ptrace_regs);
         more_ticks = hpc.read_ticks(this);
       }
@@ -2163,15 +2213,11 @@ void Task::did_waitpid(WaitStatus status) {
   session().accumulate_ticks_processed(more_ticks);
   ticks += more_ticks;
 
-  if (status.ptrace_event() == PTRACE_EVENT_EXIT) {
-    ASSERT(this, !handled_ptrace_exit_event);
-    seen_ptrace_exit_event = true;
-    if (already_reaped()) {
-      // NB: It's possible for us to have already reaped in the
-      // "Unexpected process reap" case above. If that's happened, there's
-      // nothing more to do here.
-      handled_ptrace_exit_event = true;
-    }
+  if (was_reaped_) {
+    ASSERT(this, !handled_ptrace_exit_event_);
+  } else if (status.ptrace_event() == PTRACE_EVENT_EXIT) {
+    ASSERT(this, !handled_ptrace_exit_event_);
+    seen_ptrace_exit_event_ = true;
   } else {
     if (arch() == x86 || arch() == x86_64) {
       // Clear the single step flag in case we got here by taking a signal
@@ -2574,7 +2620,7 @@ Task::CapturedState Task::capture_state() {
   state.prname = name();
   if (arch() == aarch64) {
     bool ok = read_aarch64_tls_register(&state.tls_register);
-    ASSERT(this, ok);
+    ASSERT(this, ok) << "Tracee died; this shouldn't happen in replay";
   }
   if (rseq_state) {
     state.rseq_state = make_unique<RseqState>(*rseq_state);
@@ -2668,7 +2714,7 @@ bool Task::open_mem_fd() {
   // Use ptrace to read/write during open_mem_fd
   as->set_mem_fd(ScopedFd());
 
-  if (!is_stopped) {
+  if (!is_stopped_) {
     LOG(warn) << "Can't retrieve mem fd for " << tid <<
       "; process not stopped, racing with exec?";
     return false;
@@ -3110,19 +3156,13 @@ const TraceStream* Task::trace_stream() const {
   return nullptr;
 }
 
-void Task::xptrace(int request, remote_ptr<void> addr, void* data) {
-  errno = 0;
-  fallible_ptrace(request, addr, data);
-  ASSERT(this, !errno) << "ptrace(" << ptrace_req_name<NativeArch>(request) << ", " << tid
-                       << ", addr=" << addr << ", data=" << data
-                       << ") failed with errno " << errno;
-}
+bool Task::ptrace_if_stopped(int request, remote_ptr<void> addr, void* data) {
+  ASSERT(this, is_stopped_);
 
-bool Task::ptrace_if_alive(int request, remote_ptr<void> addr, void* data) {
   errno = 0;
   fallible_ptrace(request, addr, data);
   if (errno == ESRCH) {
-    LOG(debug) << "ptrace_if_alive tid " << tid << " was not alive";
+    LOG(debug) << "ptrace_if_stopped tid " << tid << " was not stopped";
     return false;
   }
   ASSERT(this, !errno) << "ptrace(" << ptrace_req_name<NativeArch>(request) << ", " << tid
@@ -3145,7 +3185,9 @@ bool Task::clone_syscall_is_complete(pid_t* new_pid,
   int event = ptrace_event();
   if (PTRACE_EVENT_CLONE == event || PTRACE_EVENT_FORK == event ||
       PTRACE_EVENT_VFORK == event) {
-    *new_pid = get_ptrace_eventmsg<pid_t>();
+    *new_pid = get_ptrace_eventmsg_pid();
+    ASSERT(this, *new_pid >= 0)
+      << "Task was killed just after clone/fork/vfork and before we could get the new pid; giving up";
     return true;
   }
   ASSERT(this, !event) << "Unexpected ptrace event "
@@ -3754,22 +3796,77 @@ static bool copy_mem_mapping_just_used(Task* from, Task* to, const KernelMapping
   return true;
 }
 
-static void move_vdso_mapping(AutoRemoteSyscalls &remote, const KernelMapping &km) {
-  for (const auto& m : remote.task()->vm()->maps()) {
-    if  (m.map.is_vdso() && m.map.start() != km.start()) {
-      LOG(debug) << "Moving VDSO for " << remote.task()->tid;
-      /* Remap VDSO to the address that is used in the target process,
-         before it gets unmapped.
-         Otherwise the kernel seems to put the address of the original
-         VDSO __kernel_rt_sigreturn function as return address on the stack.
-         This might not affect x86_64 because there __restore_rt
-         located in libpthread.so.0 is used. */
-      remote.infallible_syscall(syscall_number_for_mremap(remote.arch()), m.map.start(), m.map.size(),
-                                m.map.size(), MREMAP_MAYMOVE | MREMAP_FIXED, km.start());
-      remote.task()->vm()->remap(remote.task(), m.map.start(), m.map.size(), km.start(), m.map.size(),
-                                 MREMAP_MAYMOVE | MREMAP_FIXED);
+static void mremap_move(AutoRemoteSyscalls& remote, remote_ptr<void> src,
+    remote_ptr<void> dest, size_t size, const char* message) {
+  if (!size) {
+    return;
+  }
+  long ret = remote.syscall(syscall_number_for_mremap(remote.arch()),
+                            src, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, dest);
+  ASSERT(remote.task(), remote_ptr<void>(ret) == dest)
+    << "Failed to move from " << src << " to " << dest << " "
+    << HEX(size) << " bytes, ret=" << ret << ", " << message;
+  remote.task()->vm()->remap(remote.task(), src, size, dest, size,
+                             MREMAP_MAYMOVE | MREMAP_FIXED);
+}
+
+/* Remap VDSO and VVAR to the addresses is used in the target process,
+   before they get unmapped.
+   Otherwise the kernel seems to put the address of the original
+   VDSO __kernel_rt_sigreturn function as return address on the stack.
+   This might not affect x86_64 because there __restore_rt
+   located in libpthread.so.0 is used.
+*/
+static void move_vdso_and_vvar_mappings(AutoRemoteSyscalls& remote,
+    const KernelMapping& vdso_new, const KernelMapping& vvar_new) {
+  KernelMapping vdso_current;
+  KernelMapping vvar_current;
+  Task* t = remote.task();
+  for (const auto& m : t->vm()->maps()) {
+    if (m.map.is_vdso()) {
+      vdso_current = m.map;
+    } else if (m.map.is_vvar()) {
+      vvar_current = m.map;
     }
   }
+
+  ASSERT(t, vdso_current.size() == vdso_new.size())
+    << "VDSO size mismatch";
+  ASSERT(t, vvar_current.size() == vvar_new.size() || !vvar_new.size())
+    << "VVAR size mismatch";
+
+  // Handle case where old and new addresses overlap by finding a free range early in the
+  // address space we can use as a temporary buffer. VDSOs are always at fairly high
+  // addresses so this shouldn't introduce any new overlap issues.
+  // We move VDSO and VVAR to their temp addresses first, then move both of them to their
+  // final address, to avoid situations where current's VDSO overlaps target's VVAR or
+  // vice versa.
+  size_t temp_size = vdso_new.size() + vvar_new.size();
+  remote_ptr<void> vdso_temp_address = t->vm()->find_free_memory(t,
+        temp_size,
+        remote_ptr<void>(65536), AddressSpace::FindFreeMemoryPolicy::STRICT_SEARCH);
+  remote_ptr<void> vvar_temp_address = vdso_temp_address + vdso_new.size();
+  MemoryRange temp_range(vdso_temp_address, temp_size);
+  ASSERT(t, !temp_range.intersects(vdso_new))
+    << "Free memory found overlaps new VDSO address";
+  ASSERT(t, !temp_range.intersects(vvar_new))
+    << "Free memory found overlaps new VVAR address";
+
+  mremap_move(remote, vdso_current.start(), vdso_temp_address, vdso_new.size(),
+              "vdso_current.start() -> vdso_temp_address");
+  if (vvar_new.size()) {
+    mremap_move(remote, vvar_current.start(), vvar_temp_address, vvar_current.size(),
+                "vvar_current.start() -> vvar_temp_address");
+  } else {
+    bool ok = remote.infallible_munmap_syscall_if_alive(vvar_current.start(),
+        vvar_current.size());
+    ASSERT(t, ok) << "Duped task got killed?";
+    t->vm()->unmap(t, vvar_current.start(), vvar_current.size());
+  }
+  mremap_move(remote, vdso_temp_address, vdso_new.start(), vdso_new.size(),
+              "vdso_temp_address -> vdso_new.start()");
+  mremap_move(remote, vvar_temp_address, vvar_new.start(), vvar_new.size(),
+              "vvar_temp_address -> vvar_new.start()");
 }
 
 const int all_rlimits[] = {
@@ -3784,7 +3881,7 @@ void Task::dup_from(Task *other) {
   KernelMapping stack_mapping;
   bool found_stack = false;
   KernelMapping vdso_mapping;
-  bool found_vdso = false;
+  KernelMapping vvar_mapping;
 
   for (auto map : other->vm()->maps()) {
     auto km = map.map;
@@ -3804,11 +3901,13 @@ void Task::dup_from(Task *other) {
       stack_mapping = km;
       found_stack = true;
     } else {
-      mappings.push_back(km);
-    }
-    if (km.is_vdso()) {
-      found_vdso = true;
-      vdso_mapping = km;
+      if (km.is_vdso()) {
+        vdso_mapping = km;
+      } else if (km.is_vvar()) {
+        vvar_mapping = km;
+      } else if (!km.is_vsyscall()) {
+        mappings.push_back(km);
+      }
     }
   }
   ASSERT(this, found_stack);
@@ -3820,12 +3919,12 @@ void Task::dup_from(Task *other) {
   }
   {
     AutoRemoteSyscalls remote(this, AutoRemoteSyscalls::DISABLE_MEMORY_PARAMS);
-    if (found_vdso) {
-      move_vdso_mapping(remote, vdso_mapping);
-    }
+    move_vdso_and_vvar_mappings(remote, vdso_mapping, vvar_mapping);
     LOG(debug) << "Unmapping memory for " << tid;
     // TODO: Only do this if the rr page isn't already mapped
-    this->vm()->unmap_all_but_rr_page(remote);
+    AddressSpace::UnmapOptions options;
+    options.exclude_vdso_vvar = true;
+    this->vm()->unmap_all_but_rr_mappings(remote, options);
     LOG(debug) << "Creating stack mapping " << stack_mapping << " for " << tid;
     create_mapping(this, remote, stack_mapping);
     LOG(debug) << "Copying stack into " << tid;
@@ -3834,9 +3933,6 @@ void Task::dup_from(Task *other) {
   {
     AutoRemoteSyscalls remote_this(this);
     for (auto &km : mappings) {
-      if (km.is_vsyscall()) {
-        continue;
-      }
       LOG(debug) << "Creating mapping " << km << " for " << tid;
       create_mapping(this, remote_this, km);
       LOG(debug) << "Copying mapping into " << tid;
@@ -3927,9 +4023,6 @@ static void __ptrace_cont(Task* t, ResumeRequest resume_how,
                           int expect_syscallno2 = -1, pid_t new_tid = -1) {
   t->resume_execution(resume_how, RESUME_NONBLOCKING, RESUME_NO_TICKS);
   while (true) {
-    if (t->wait_unexpected_exit()) {
-      break;
-    }
     // Do our own waiting instead of calling Task::wait() so we can detect and
     // handle tid changes due to off-main-thread execve.
     WaitOptions options(t->tid);
@@ -3970,9 +4063,8 @@ static void __ptrace_cont(Task* t, ResumeRequest resume_how,
 }
 
 void Task::did_handle_ptrace_exit_event() {
-  ASSERT(this, seen_ptrace_exit_event);
-  ASSERT(this, !handled_ptrace_exit_event);
-  handled_ptrace_exit_event = true;
+  ASSERT(this, !handled_ptrace_exit_event_);
+  handled_ptrace_exit_event_ = true;
 }
 
 void Task::os_exec(SupportedArch exec_arch, std::string filename)

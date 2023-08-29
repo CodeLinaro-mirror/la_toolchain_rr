@@ -1684,7 +1684,7 @@ static void end_task(ReplayTask* t) {
 }
 
 Completion ReplaySession::exit_task(ReplayTask* t) {
-  ASSERT(t, !t->seen_ptrace_exit_event);
+  ASSERT(t, !t->seen_ptrace_exit_event());
   // Apply robust-futex updates captured during recording.
   t->apply_all_data_records_from_trace();
   end_task(t);
@@ -2097,7 +2097,9 @@ void ReplaySession::detach_tasks(pid_t new_ptracer, ScopedFd& new_tracee_socket_
   for (auto& entry : task_map) {
     Task* t = entry.second;
     t->flush_regs();
-    t->xptrace(PTRACE_DETACH, nullptr, (void*)SIGSTOP);
+    errno = 0;
+    t->fallible_ptrace(PTRACE_DETACH, nullptr, (void*)SIGSTOP);
+    ASSERT(t, !errno) << "failed to detach, with errno " << errno;
   }
   forget_tasks();
 }

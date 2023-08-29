@@ -867,7 +867,12 @@ public:
   };
 
   void map_rr_page(AutoRemoteSyscalls& remote);
-  void unmap_all_but_rr_page(AutoRemoteSyscalls& remote);
+  struct UnmapOptions {
+    bool exclude_vdso_vvar;
+    UnmapOptions() : exclude_vdso_vvar(false) {}
+  };
+  void unmap_all_but_rr_mappings(AutoRemoteSyscalls& remote,
+                                 UnmapOptions options = UnmapOptions());
 
   void erase_task(Task* t) {
     this->HasTaskSet::erase_task(t);
@@ -888,6 +893,9 @@ public:
   // Whether to return WatchConfigs consisting of only aligned locations
   // suitable for hardware watchpoint registers.
   enum WatchpointAlignment { UNALIGNED, ALIGNED };
+
+  // Returns true if the range is completely covered by private mappings
+  bool range_is_private_mapping(const MemoryRange& range) const;
 
 private:
   struct Breakpoint;
@@ -1222,8 +1230,8 @@ private:
  */
 class KernelMapIterator {
 public:
-  KernelMapIterator(Task* t);
-  KernelMapIterator(pid_t tid) : tid(tid) { init(); }
+  KernelMapIterator(Task* t, bool* ok = nullptr);
+  KernelMapIterator(pid_t tid, bool* ok = nullptr) : tid(tid) { init(ok); }
   ~KernelMapIterator();
 
   // It's very important to keep in mind that btrfs files can have the wrong
@@ -1238,7 +1246,7 @@ public:
   void operator++();
 
 private:
-  void init();
+  void init(bool* ok = nullptr);
 
   pid_t tid;
   FILE* maps_file;

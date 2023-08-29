@@ -75,12 +75,13 @@ static bool thread_group_in_exec(Task* t) {
   return false;
 }
 
-KernelMapIterator::KernelMapIterator(Task* t) : tid(t->tid) {
+KernelMapIterator::KernelMapIterator(Task* t, bool* ok)
+  : tid(t->tid) {
   // See https://lkml.org/lkml/2016/9/21/423
   ASSERT(t, !thread_group_in_exec(t)) << "Task-group in execve, so reading "
                                          "/proc/.../maps may trigger kernel "
                                          "deadlock!";
-  init();
+  init(ok);
 }
 
 KernelMapIterator::~KernelMapIterator() {
@@ -89,11 +90,18 @@ KernelMapIterator::~KernelMapIterator() {
   }
 }
 
-void KernelMapIterator::init() {
+void KernelMapIterator::init(bool* ok) {
   char maps_path[PATH_MAX];
   sprintf(maps_path, "/proc/%d/maps", tid);
+  if (ok) {
+    *ok = true;
+  }
   if (!(maps_file = fopen(maps_path, "r"))) {
-    FATAL() << "Failed to open " << maps_path;
+    if (ok) {
+      *ok = false;
+    } else {
+      FATAL() << "Failed to open " << maps_path;
+    }
   }
   ++*this;
 }
@@ -171,7 +179,12 @@ void KernelMapIterator::operator++() {
 
 static KernelMapping read_kernel_mapping(pid_t tid, remote_ptr<void> addr) {
   MemoryRange range(addr, 1);
-  for (KernelMapIterator it(tid); !it.at_end(); ++it) {
+  bool ok;
+  KernelMapIterator it(tid, &ok);
+  if (!ok) {
+    return KernelMapping();
+  }
+  for (; !it.at_end(); ++it) {
     const KernelMapping& km = it.current();
     if (km.contains(range)) {
       return km;
@@ -348,13 +361,15 @@ void AddressSpace::map_rr_page(AutoRemoteSyscalls& remote) {
       TRACED, PRIVILEGED, RECORDING_AND_REPLAY, t->arch());
 }
 
-void AddressSpace::unmap_all_but_rr_page(AutoRemoteSyscalls& remote) {
+void AddressSpace::unmap_all_but_rr_mappings(AutoRemoteSyscalls& remote,
+    UnmapOptions options) {
   vector<MemoryRange> unmaps;
   for (const auto& m : maps()) {
     // Do not attempt to unmap [vsyscall] --- it doesn't work.
     if (m.map.start() != AddressSpace::rr_page_start() &&
         m.map.start() != AddressSpace::preload_thread_locals_start() &&
-        !m.map.is_vsyscall()) {
+        !m.map.is_vsyscall() &&
+        (!options.exclude_vdso_vvar || (!m.map.is_vdso() && m.map.is_vvar()))) {
       unmaps.push_back(m.map);
     }
   }
@@ -2416,6 +2431,24 @@ void AddressSpace::fd_tables_changed() {
     rt->write_mem(addr, fdt_uniform);
     rt->record_local(addr, sizeof(fdt_uniform), &fdt_uniform);
   }
+}
+
+bool AddressSpace::range_is_private_mapping(const MemoryRange& range) const {
+  MemoryRange r = range;
+  while (r.size() > 0) {
+    if (!has_mapping(r.start())) {
+      return false;
+    }
+    const AddressSpace::Mapping& m = mapping_of(r.start());
+    if (!(m.map.flags() & MAP_PRIVATE)) {
+      return false;
+    }
+    if (m.map.end() >= r.end()) {
+      return true;
+    }
+    r = MemoryRange(m.map.end(), r.end());
+  }
+  return true;
 }
 
 } // namespace rr

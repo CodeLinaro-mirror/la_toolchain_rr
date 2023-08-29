@@ -43,24 +43,23 @@ import re
 
 def gdb_unescape(string):
     str_len = len(string)
-    if str_len % 2:
+    if str_len % 2: # check for unexpected string length
         return ""
-    result = "" # check for unexpected string length
+    result = bytearray()
     try:
         pos = 0
         while pos < str_len:
             hex_char = string[pos:pos+2]
-            result += chr(int(hex_char, 16))
+            result.append(int(hex_char, 16))
             pos += 2
     except: # check for unexpected string value
         return ""
-    return result
+    return result.decode('utf-8')
 
 def gdb_escape(string):
     result = ""
-    pos = 0
-    for curr_char in string:
-        result += format(ord(curr_char), '02x')
+    for curr_char in string.encode('utf-8'):
+        result += format(curr_char, '02x')
     return result
 
 class RRWhere(gdb.Command):
@@ -121,10 +120,14 @@ class RRCmd(gdb.Command):
             gdb.write("Response error: " + rv)
             return
         response = gdb_unescape(rv_match.group(1))
-        gdb.write(response)
+        if response != '\n':
+            gdb.write(response)
 
 def history_push(p):
-    gdb.execute("rr-history-push", to_string=True)
+    # ensure any output (e.g. produced by breakpoint commands running during our
+    # processing, that were triggered by the stop we've been notified for)
+    # is echoed as normal.
+    gdb.execute("rr-history-push")
 
 rr_suppress_run_hook = False
 
@@ -205,7 +208,7 @@ static string gdb_escape(const string& str) {
   const size_t len = str.size();
   const char *data = str.data();
   for (size_t i = 0; i < len; i++) {
-    int chr = data[i];
+    int chr = (uint8_t)data[i];
     if (chr < 16) {
       ss << "0";
     }

@@ -552,10 +552,18 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
       * the "extra data" for the possibly one pending
       * record.
       *
+      * The deterministic region excludes the notify_on_syscall_hook_exit
+      * flag. This flag is written by is_safe_to_deliver_signal and
+      * that write can occur at a different event to where ReplaySession
+      * eventually sets it.
+      *
       * So here, we set things up so that we only checksum
       * the deterministic region. */
-      auto child_hdr = m.map.start().cast<struct syscallbuf_hdr>();
-      auto hdr = t->read_mem(child_hdr);
+      struct syscallbuf_hdr hdr;
+      ASSERT(t, mem.size() >= sizeof(hdr));
+      memcpy(&hdr, mem.data(), sizeof(hdr));
+      hdr.notify_on_syscall_hook_exit = 0;
+      memcpy(mem.data(), &hdr, sizeof(hdr));
       mem.resize(sizeof(hdr) + hdr.num_rec_bytes +
                  sizeof(struct syscallbuf_record));
     }
@@ -2190,6 +2198,73 @@ bool is_directory(const char* path) {
     return false;
   }
   return (buf.st_mode & S_IFDIR) != 0;
+}
+
+const char* filename(const char* path) {
+  const char* dir = strrchr(path, '/');
+  return dir ? ++dir : path;
+}
+
+bool is_trace(const string& trace) {
+  string ver = trace + "/version";
+  string inc = trace + "/incomplete";
+  return access(ver.c_str(), F_OK) == 0 || access(inc.c_str(), F_OK) == 0;
+}
+
+bool is_latest_trace(const string& trace) {
+  string latest = latest_trace_symlink();
+  if (access(latest.c_str(), F_OK) != 0) {
+    return false;
+  }
+  latest = real_path(latest);
+  return latest == trace; 
+}
+
+bool remove_latest_trace_symlink() {
+  const string latest = latest_trace_symlink();
+  int ret = remove(latest.c_str());
+  if (ret) {
+    perror(latest.c_str());
+    fprintf(stderr,
+            "\n"
+            "rr: Failed to remove latest_trace symlink: error code %d\n"
+            "\n",
+            ret);
+    return false;
+  }
+  return true;
+}
+
+bool is_valid_trace_name(const string& entry, std::string* reason) {
+  // filename corresponds to dirname
+  const string name = filename(entry.c_str());
+
+  if (name.empty()) {
+    if (reason) {
+      *reason = "Empty";
+    }
+    return false;
+  }
+  if (name[0] == '.' || name[0] == '#') {
+    if (reason) {
+      *reason = "Cannot start with . or #";
+    }
+    return false;
+  }
+  if (name[name.length() - 1] == '~') {
+    if (reason) {
+      *reason = "Cannot end with ~";
+    }
+    return false;
+  }
+  if (name == "cpu_lock") {
+    if (reason) {
+      *reason = "Name cpu_lock is reserved";
+    }
+    return false;
+  }
+
+  return true;
 }
 
 ssize_t read_to_end(const ScopedFd& fd, size_t offset, void* buf, size_t size) {

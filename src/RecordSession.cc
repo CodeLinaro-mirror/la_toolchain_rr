@@ -154,19 +154,19 @@ static bool looks_like_syscall_entry(RecordTask* t) {
 
 /**
  * Return true if we handle a ptrace exit event for task t. When this returns
- * true, t has been deleted and cannot be referenced again.
+ * true, t may have been deleted.
  */
 static bool handle_ptrace_exit_event(RecordTask* t) {
-  if (t->already_reaped()) {
-    t->did_reach_zombie();
-    return true;
-  }
-
-  if (t->ptrace_event() != PTRACE_EVENT_EXIT) {
+  if (t->was_reaped()) {
+    if (t->handled_ptrace_exit_event()) {
+      t->did_reach_zombie();
+      return true;
+    }
+  } else if (t->ptrace_event() != PTRACE_EVENT_EXIT) {
     return false;
   }
 
-  if (t->stable_exit) {
+  if (t->stable_exit || t->was_reaped()) {
     LOG(debug) << "stable exit";
   } else {
     if (!t->may_be_blocked()) {
@@ -264,16 +264,20 @@ static bool handle_ptrace_exit_event(RecordTask* t) {
     t->destroy_buffers(nullptr, nullptr);
   }
 
-  record_robust_futex_changes(t);
-
   WaitStatus exit_status;
-  unsigned long msg = 0;
-  // We can get ESRCH here if the child was killed by SIGKILL and
-  // we made a synthetic PTRACE_EVENT_EXIT to handle it.
-  if (t->ptrace_if_alive(PTRACE_GETEVENTMSG, nullptr, &msg)) {
-    exit_status = WaitStatus(msg);
+  if (t->was_reaped()) {
+    exit_status = t->status();
   } else {
-    exit_status = WaitStatus::for_fatal_sig(SIGKILL);
+    record_robust_futex_changes(t);
+
+    unsigned long msg = 0;
+    // If ptrace_if_stopped fails, then the task has been killed by SIGKILL
+    // or equivalent.
+    if (t->ptrace_if_stopped(PTRACE_GETEVENTMSG, nullptr, &msg)) {
+      exit_status = WaitStatus(msg);
+    } else {
+      exit_status = WaitStatus::for_fatal_sig(SIGKILL);
+    }
   }
 
   t->did_handle_ptrace_exit_event();
@@ -281,24 +285,24 @@ static bool handle_ptrace_exit_event(RecordTask* t) {
   // If we died because of a coredumping signal, that is a barrier event, and
   // every task in the address space needs to pass its PTRACE_EXIT_EVENT before
   // they proceed to (potentially hidden) zombie state, so we can't wait for
-  // that to happen/
+  // that to happen.
   // Similarly we can't wait for this task to exit if there are other
   // tasks in its pid namespace that need to exit and this is the last thread
   // of pid-1 in that namespace, because the kernel must reap them before
   // letting this task complete its exit.
-  bool may_wait_exit = !is_coredumping_signal(exit_status.fatal_sig()) &&
+  bool may_wait_exit = !t->was_reaped() && !is_coredumping_signal(exit_status.fatal_sig()) &&
     !t->waiting_for_pid_namespace_tasks_to_exit();
   record_exit_trace_event(t, exit_status);
   t->record_exit_event(
-    (!t->already_reaped() && !may_wait_exit) ? RecordTask::WRITE_CHILD_TID : RecordTask::KERNEL_WRITES_CHILD_TID);
-  if (!t->already_reaped()) {
+    (!t->was_reaped() && !may_wait_exit) ? RecordTask::WRITE_CHILD_TID : RecordTask::KERNEL_WRITES_CHILD_TID);
+  if (!t->was_reaped()) {
     t->proceed_to_exit(may_wait_exit);
   }
   t->do_ptrace_exit_stop(exit_status);
   if (may_wait_exit) {
     t->did_reach_zombie();
-  } else {
-    t->waiting_for_zombie = true;
+  } else if (!t->was_reaped()) {
+    t->waiting_for_reap = true;
   }
   return true;
 }
@@ -487,12 +491,8 @@ static void seccomp_trap_done(RecordTask* t) {
   // It's safe to reset the syscall buffer now.
   t->delay_syscallbuf_reset_for_seccomp_trap = false;
 
-  t->write_mem(REMOTE_PTR_FIELD(t->syscallbuf_child, failed_during_preparation),
-               (uint8_t)1);
-  uint8_t one = 1;
-  t->record_local(
-      REMOTE_PTR_FIELD(t->syscallbuf_child, failed_during_preparation), &one);
-
+  t->write_and_record(REMOTE_PTR_FIELD(t->syscallbuf_child, failed_during_preparation),
+                      (uint8_t)1);
   if (EV_DESCHED == t->ev().type()) {
     // Desched processing will do the rest for us
     return;
@@ -913,9 +913,6 @@ void RecordSession::task_continue(const StepState& step_state) {
     }
   }
   t->resume_execution(resume, RESUME_NONBLOCKING, ticks_request);
-  if (t->is_running()) {
-    scheduler().started(t);
-  }
 }
 
 /**
@@ -933,7 +930,7 @@ static void advance_to_disarm_desched_syscall(RecordTask* t) {
   /* TODO: mask off signals and avoid this loop. */
   do {
     t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_UNLIMITED_TICKS);
-    if (t->is_dying()) {
+    if (t->seen_ptrace_exit_event()) {
       return;
     }
     if (t->status().is_syscall()) {
@@ -1099,8 +1096,10 @@ static void save_interrupted_syscall_ret_in_syscallbuf(RecordTask* t,
   // Record storing the return value in the syscallbuf record, where
   // we expect to find it during replay.
   auto child_rec = t->next_syscallbuf_record();
-  int64_t ret = retval;
-  t->record_local(REMOTE_PTR_FIELD(child_rec, ret), &ret);
+  // Also store it there now so that our memory checksums are correct.
+  // It will be overwritten by the tracee's syscallbuf code.
+  t->write_and_record(REMOTE_PTR_FIELD(child_rec, ret),
+                      static_cast<int64_t>(retval));
 }
 
 static bool is_in_privileged_syscall(RecordTask* t) {
@@ -1532,7 +1531,8 @@ static bool inject_handled_signal(RecordTask* t) {
 
   // We stepped into a user signal handler.
   ASSERT(t, t->stop_sig() == SIGTRAP)
-      << "Got unexpected status " << t->status();
+      << "Got unexpected status " << t->status() << " trying to deliver " << sig
+      << " siginfo is " << t->get_siginfo();
   ASSERT(t, t->get_signal_user_handler(sig) == t->ip())
       << "Expected handler IP " << t->get_signal_user_handler(sig) << ", got "
       << t->ip()
@@ -2503,6 +2503,14 @@ RecordSession::RecordResult RecordSession::record_step() {
     return result;
   }
   RecordTask* t = scheduler().current();
+  if (!t) {
+    // No child to schedule. Yield to our caller to give it a chance
+    // to do something (e.g. terminate the recording).
+    return result;
+  }
+  // If the task has been reaped prematurely then it's not running
+  // and we can't get registers etc, so minimize what we do between here
+  // to handle_ptrace_exit_event().
   if (t->waiting_for_reap) {
     // Give it another chance to be reaped
     t->did_reach_zombie();
@@ -2516,10 +2524,6 @@ RecordSession::RecordResult RecordSession::record_step() {
       prev_task->record_current_event();
     }
     prev_task->pop_event(EV_SCHED);
-  }
-  if (rescheduled.started_new_timeslice) {
-    t->registers_at_start_of_last_timeslice = t->regs();
-    t->time_at_start_of_last_timeslice = trace_writer().time();
   }
 
   // Have to disable context-switching until we know it's safe
@@ -2536,6 +2540,11 @@ RecordSession::RecordResult RecordSession::record_step() {
     // t may have been deleted.
     last_task_switchable = ALLOW_SWITCH;
     return result;
+  }
+
+  if (rescheduled.started_new_timeslice) {
+    t->registers_at_start_of_last_timeslice = t->regs();
+    t->time_at_start_of_last_timeslice = trace_writer().time();
   }
 
   StepState step_state(CONTINUE);

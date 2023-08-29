@@ -784,6 +784,7 @@ static void __attribute__((constructor)) init_process(void) {
   extern RR_HIDDEN void _syscall_hook_trampoline_48_89_e5(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_48_89_fb(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_48_8d_b3_f0_08_00_00(void);
+  extern RR_HIDDEN void _syscall_hook_trampoline_nops(void);
 
 #define MOV_RDX_VARIANTS \
   MOV_RDX_TO_REG(48, d0) \
@@ -1002,6 +1003,12 @@ static void __attribute__((constructor)) init_process(void) {
       3,
       { 0x48, 0x89, 0xfb },
       (uintptr_t)_syscall_hook_trampoline_48_89_fb },
+    /* Support explicit 5 byte nop (`nopl 0(%ax, %ax, 1)`) before 'rdtsc' or syscall (may ignore interfering branches) */
+    { PATCH_SYSCALL_INSTRUCTION_IS_LAST |
+      PATCH_IS_NOP_INSTRUCTIONS,
+      5,
+      { 0x0f, 0x1f, 0x44, 0x00, 0x00 },
+      (uintptr_t)_syscall_hook_trampoline_nops }
   };
 #elif defined(__aarch64__)
   extern RR_HIDDEN void _syscall_hook_trampoline_raw(void);
@@ -3587,6 +3594,33 @@ static long sys_statx(struct syscall_info* call) {
 }
 #endif
 
+static long sys_fstatat(struct syscall_info* call) {
+  const int syscallno = call->no;
+  stat64_t* buf = (stat64_t*)call->args[2];
+
+  /* Like stat(), not arming the desched event because it's not
+   * needed for correctness, and there are no data to suggest
+   * whether it's a good idea perf-wise. */
+  void* ptr = prep_syscall();
+  stat64_t* buf2 = NULL;
+  long ret;
+
+  if (buf) {
+    buf2 = ptr;
+    ptr += sizeof(*buf2);
+  }
+
+  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+    return traced_raw_syscall(call);
+  }
+  ret = untraced_syscall4(syscallno,
+    call->args[0], call->args[1], buf2, call->args[3]);
+  if (buf2 && ret >= 0 && !buffer_hdr()->failed_during_preparation) {
+    local_memcpy(buf, buf2, sizeof(*buf));
+  }
+  return commit_raw_syscall(syscallno, ptr, ret);
+}
+
 static long sys_quotactl(struct syscall_info* call) {
   const int syscallno = call->no;
   int cmd = call->args[0];
@@ -4193,6 +4227,12 @@ case SYS_epoll_pwait:
     case SYS_statfs:
     case SYS_fstatfs:
       return sys_statfs(call);
+#if defined(SYS_newfstatat)
+    case SYS_newfstatat:
+#elif defined(SYS_fstatat64)
+    case SYS_fstatat64:
+#endif
+      return sys_fstatat(call);
 #undef CASE
 #undef CASE_GENERIC_NONBLOCKING
 #undef CASE_GENERIC_NONBLOCKING_FD

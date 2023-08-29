@@ -86,13 +86,7 @@ endif()
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${FLAGS_COMMON} -Wstrict-prototypes -std=gnu11")
 # Define __STDC_LIMIT_MACROS so |#include <stdint.h>| works as expected.
 # Define __STDC_FORMAT_MACROS so |#include <inttypes.h>| works as expected.
-include(CheckCXXCompilerFlag)
-CHECK_CXX_COMPILER_FLAG("-std=c++14" SUPPORTS_CXX14)
-if (SUPPORTS_CXX14)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FLAGS_COMMON} -D__STDC_LIMIT_MACROS -D__STDC_FORMAT_MACROS -std=c++14")
-else()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FLAGS_COMMON} -D__STDC_LIMIT_MACROS -D__STDC_FORMAT_MACROS -std=c++11")
-endif()
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FLAGS_COMMON} -D__STDC_LIMIT_MACROS -D__STDC_FORMAT_MACROS -std=c++14")
 
 # We support three build types:
 # DEBUG: suitable for debugging rr
@@ -140,7 +134,11 @@ endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-command-line-argument")
 endif()
-if (CMAKE_ASM_COMPILER_ID STREQUAL "Clang")
+# -fno-integrated-as tells Clang to use whatever "as" happens to be. For an
+# Android build that will end up being whatever /usr/bin/as is, and whatever it
+# is, it's the wrong assembler for Android, because Android only supports the
+# Clang assembler.
+if (CMAKE_ASM_COMPILER_ID STREQUAL "Clang" AND NOT ANDROID)
   set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -fno-integrated-as")
 endif()
 
@@ -561,8 +559,10 @@ set(RR_SOURCES
   src/MmappedFileMonitor.cc
   src/MonitoredSharedMemory.cc
   src/Monkeypatcher.cc
+  src/MvCommand.cc
   src/PackCommand.cc
   src/PerfCounters.cc
+  src/PidFdMonitor.cc
   src/ProcFdDirMonitor.cc
   src/ProcMemMonitor.cc
   src/ProcStatMonitor.cc
@@ -581,6 +581,7 @@ set(RR_SOURCES
   src/ReplayTimeline.cc
   src/RerunCommand.cc
   src/ReturnAddressList.cc
+  src/RmCommand.cc
   src/Scheduler.cc
   src/SeccompFilterRewriter.cc
   src/Session.cc
@@ -918,7 +919,6 @@ set(BASIC_TESTS
   clone_bad_tls
   clone_cleartid_coredump
   clone_fail
-  clone_file_range
   clone_immediate_exit
   clone_newflags
   clone_parent
@@ -981,6 +981,7 @@ set(BASIC_TESTS
   fork_brk
   fork_child_crash
   fork_many
+  fstatat
   futex_exit_race
   futex_exit_race_sigsegv
   futex_invalid_op
@@ -1116,6 +1117,7 @@ set(BASIC_TESTS
   pid_ns_segv
   pid_ns_shutdown
   pidfd
+  pidfd_getfd
   x86/pkeys
   poll_sig_race
   ppoll
@@ -1210,7 +1212,6 @@ set(BASIC_TESTS
   setgid
   setgroups
   setsid
-  setuid
   shared_exec
   shared_monitor
   shared_offset
@@ -1304,7 +1305,9 @@ set(BASIC_TESTS
   userfaultfd
   utimes
   vdso_parts
+  vfork_done
   vfork_flush
+  vfork_setopts
   vfork_shared
   video_capture
   vm_readv_writev
@@ -1377,6 +1380,7 @@ set(TESTS_WITH_PROGRAM
   checkpoint_mixed_mode
   checksum_sanity
   check_lost_interrupts
+  clone_file_range
   clone_interruption
   # Disabled because it fails
   # clone_share_vm
@@ -1448,12 +1452,14 @@ set(TESTS_WITH_PROGRAM
   nested_detach_wait
   nested_detach_kill_stuck
   overflow_branch_counter
+  pack
   patch_page_end
   x86/patch_40_80_f6_81
   priority
   ptrace_remote_unmap
   x86/rdtsc_loop
   x86/rdtsc_loop2
+  x86/rdtsc_interfering
   read_big_struct
   remove_latest_trace
   restart_abnormal_exit
@@ -1474,6 +1480,7 @@ set(TESTS_WITH_PROGRAM
   seccomp_open
   seccomp_signals
   segfault
+  setuid
   shared_map
   shared_persistent_file
   signal_numbers
@@ -1512,6 +1519,7 @@ set(TESTS_WITH_PROGRAM
   tls
   ttyname
   unexpected_stack_growth
+  unicode
   user_ignore_sig
   vdso_clock_gettime_stack
   vdso_gettimeofday_stack
@@ -1554,12 +1562,14 @@ set(TESTS_WITHOUT_PROGRAM
   break_thread
   break_time_slice
   breakpoint_consistent
+  breakpoint_print
   call_exit
   check_patched_pthread
   checkpoint_async_signal_syscalls_1000
   checkpoint_mmap_shared
   checkpoint_prctl_name
   checkpoint_simple
+  checksum_block_open
   checksum_sanity_noclone
   comm
   cont_signal
@@ -1584,6 +1594,7 @@ set(TESTS_WITHOUT_PROGRAM
   mprotect_step
   nested_detach
   nested_detach_kill
+  nested_detach_stop
   nested_release
   parent_no_break_child_bkpt
   parent_no_stop_child_crash
@@ -1637,6 +1648,7 @@ set(TESTS_WITHOUT_PROGRAM
   tty
   unmap_vdso
   unwind_on_signal
+  vfork_done_clone
   vfork_exec
   vfork_break_parent
   vsyscall_singlestep

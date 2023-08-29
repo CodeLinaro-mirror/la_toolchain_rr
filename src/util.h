@@ -515,6 +515,38 @@ ssize_t pwrite_all_fallible(int fd, const void* buf, size_t size, off64_t offset
  */
 bool is_directory(const char* path);
 
+/*
+ * Returns a pointer to the filename portion of the path.
+ * That is the position after the last '/'
+ */
+const char* filename(const char* path);
+
+/*
+ * Returns whether a trace is at the path by checking for a version or
+ * incomplete file.
+ * Will set errno, if false.
+ */
+bool is_trace(const std::string& path);
+
+/*
+ * Returns whether the latest_trace symlink (if any) points to |trace|.
+ */
+bool is_latest_trace(const std::string& trace);
+
+/*
+ * Deletes the latest_trace symlink, logs an error and returns false on failure.
+ */
+bool remove_latest_trace_symlink();
+
+/*
+ * Returns whether |entry| is a valid trace name.
+ * If invalid, optional out-param |reason| will be set to the reason.
+ * I.e. does not start with . or #, does not end with ~, is neither cpu_lock
+ * nor latest_trace.
+ */
+bool is_valid_trace_name(const std::string& entry,
+                         std::string* reason = nullptr);
+
 /**
  * Read bytes from `fd` into `buf` from `offset` until the read returns an
  * error or 0 or the buffer is full. Returns total bytes read or -1 for error.
