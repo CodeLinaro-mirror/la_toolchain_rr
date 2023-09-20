@@ -17,6 +17,37 @@ Googlers: use sso://android/platform/manifest as the URL.
 [rr-dev tree]:
   https://android.googlesource.com/platform/manifest/+/refs/heads/rr-dev
 
+## Updating
+
+Updating rr and its dependencies is automated by [external_updater]. The tool
+itself is hosted in AOSP, so you'll need an AOSP platform tree (see
+https://source.android.com/docs/setup/download/downloading if you don't already
+have one) to run the updater. Assuming your AOSP platform tree's root directory
+is `$AOSP`, run (from the root of your rr-dev tree):
+
+```bash
+$AOSP/tools/external_updater/updater.sh update --no-build \
+  `realpath toolchain/rr`
+```
+
+TODO: capnproto should also be updated, but external_updater crashes on that
+project, file a bug
+
+There is no automated testing of rr for Android. To smoke test the update, run
+(from the root of your rr-dev tree):
+
+```bash
+./toolchain/rr/android.build.sh
+adb push out/rr/bin/rr /data/local/tmp/
+adb push out/android-install/lib/*.so /data/local/tmp/
+adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/rr"
+```
+
+Note that rr is currently only supported for x86_64 Android. You will need to
+use an emulator or a cuttlefish device.
+
+[external_updater]: https://android.googlesource.com/platform/tools/external_updater/
+
 ## Development
 
 For first time set-up, install https://python-poetry.org/, then run
