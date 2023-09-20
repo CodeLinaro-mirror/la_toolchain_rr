@@ -78,11 +78,14 @@ enum ResumeRequest {
   RESUME_SYSEMU_SINGLESTEP = NativeArch::PTRACE_SYSEMU_SINGLESTEP,
 };
 enum WaitRequest {
+  // Don't wait after resuming.
+  RESUME_NONBLOCKING,
   // After resuming, blocking-waitpid() until tracee status
   // changes.
   RESUME_WAIT,
-  // Don't wait after resuming.
-  RESUME_NONBLOCKING
+  // Like RESUME_WAIT, but we're not expecting a PTRACE_EVENT_EXIT
+  // or reap, so return false also in that case.
+  RESUME_WAIT_NO_EXIT
 };
 enum TicksRequest {
   // We don't expect to see any ticks (though we seem to on the odd buggy
@@ -254,11 +257,17 @@ public:
   pid_t pid_of_pidfd(int fd);
 
   /**
-   * Force the wait status of this to |status|, as if
-   * |wait()/try_wait()| had returned it. Call this whenever a waitpid
-   * returned activity for this past.
+   * Records the wait status of this task as |status|, e.g. if
+   * |wait()/try_wait()| has returned it. Call this whenever a waitpid
+   * returned activity for this task.
+   * If this returns false, then the task was kicked out of a ptrace-stop
+   * by SIGKILL or equivalent before we could read registers etc.
+   * We will treat this stop as if it never happened; the caller must
+   * act as if there was no stop.
+   * If `status.reaped()` (i.e. fatal signal or normal exit), this always
+   * returns true.
    */
-  void did_waitpid(WaitStatus status);
+  bool did_waitpid(WaitStatus status);
 
   /**
    * Syscalls have side effects on registers (e.g. setting the flags register).
@@ -432,7 +441,7 @@ public:
    * a syscall, depending on the value of Session::syscall_seccomp_ordering()).
    * Continue into the kernel to perform the syscall and stop at the
    * PTRACE_SYSCALL syscall-exit trap. Returns false if we see the process exit
-   * before that.
+   * before that; we may or may not be stopped in that case.
    */
   bool exit_syscall();
 
@@ -575,8 +584,12 @@ public:
    * after that many seconds have elapsed.
    *
    * All tracee execution goes through here.
+   *
+   * If `wait_how` == RESUME_WAIT and we don't complete a
+   * did_waitpid() (e.g. because the tracee was SIGKILLed or
+   * equivalent), this returns false.
    */
-  void resume_execution(ResumeRequest how, WaitRequest wait_how,
+  bool resume_execution(ResumeRequest how, WaitRequest wait_how,
                         TicksRequest tick_period, int sig = 0);
 
   /** Return the session this is part of. */
@@ -712,8 +725,12 @@ public:
    * with the process in a stopped() state. If interrupt_after_elapsed >= 0,
    * interrupt the task after that many seconds have elapsed. If
    * interrupt_after_elapsed == 0.0, the interrupt will happen immediately.
+   * Returns false if the wait failed because we reached a stop but we got
+   * SIGKILLed (or equivalent) out of it, in which case it is not safe to wait
+   * because that might block indefinitely waiting for us to acknowledge the
+   * PTRACE_EVENT_EXIT of other tasks.
    */
-  void wait(double interrupt_after_elapsed = -1);
+  bool wait(double interrupt_after_elapsed = -1);
 
   /**
    * Currently we don't allow recording across uid changes, so we can
@@ -1079,8 +1096,9 @@ public:
   /**
    * Try to move this task to a signal stop by signaling it with the
    * syscallbuf desched signal (which is guaranteed not to be blocked).
+   * Returns false if the task exited unexpectedly.
    */
-  void move_to_signal_stop();
+  bool move_to_signal_stop();
 
   // A map from original table to (potentially detached) clone, to preserve
   // FdTable sharing relationships during a session fork.
@@ -1250,7 +1268,12 @@ protected:
   // Count of all ticks seen by this task since tracees became
   // consistent and the task last wait()ed.
   Ticks ticks;
-  // When |is_stopped_|, these are our child registers.
+  // Copy of the child registers.
+  // When is_stopped_ or in_unexpected_exit, these are the source of
+  // truth. Otherwise the child is running and the registers could be
+  // changed by the kernel or user-space execution, and the values here
+  // are meaningless.
+  // See also registers_dirty.
   Registers registers;
   // Where we last resumed execution
   remote_code_ptr address_of_last_execution_resume;
@@ -1273,6 +1296,9 @@ protected:
   // without our knowledge, due to a SIGKILL or equivalent such as
   // zap_pid_ns_processes.
   bool is_stopped_;
+  // True when we've been kicked out of a ptrace-stop via SIGKILL or
+  // equivalent.
+  bool in_unexpected_exit;
   /* True when the seccomp filter has been enabled via prctl(). This happens
    * in the first system call issued by the initial tracee (after it returns
    * from kill(SIGSTOP) to synchronize with the tracer). */

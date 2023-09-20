@@ -492,7 +492,8 @@ Completion ReplaySession::cont_syscall_boundary(
   } else {
     ResumeRequest resume_how =
         constraints.is_singlestep() ? RESUME_SYSEMU_SINGLESTEP : RESUME_SYSEMU;
-    t->resume_execution(resume_how, RESUME_WAIT, ticks_request);
+    bool ok = t->resume_execution(resume_how, RESUME_WAIT_NO_EXIT, ticks_request);
+    ASSERT(t, ok) << "Tracee died unexpectedly";
   }
 
   switch (t->stop_sig()) {
@@ -525,7 +526,8 @@ Completion ReplaySession::cont_syscall_boundary(
       syscall_seccomp_ordering_ = PTRACE_SYSCALL_BEFORE_SECCOMP;
     }
     // Eat the following event, either a seccomp or syscall notification
-    t->resume_execution(RESUME_SYSEMU, RESUME_WAIT, ticks_request);
+    bool ok = t->resume_execution(RESUME_SYSEMU, RESUME_WAIT_NO_EXIT, ticks_request);
+    ASSERT(t, ok) << "Tracee died unexpectedly";
   }
 
   t->apply_syscall_entry_regs();
@@ -557,18 +559,7 @@ static void emulate_syscall_entry(ReplayTask* t, const TraceFrame& frame,
                                   remote_code_ptr syscall_instruction) {
   Registers r = t->regs();
   r.set_ip(syscall_instruction.increment_by_syscall_insn_length(t->arch()));
-  r.set_original_syscallno(r.syscallno());
-  r.set_orig_arg1(r.arg1());
-  /**
-   * The aarch64 kernel has a quirk where if the syscallno is -1 (and only -1),
-   * it will apply the -ENOSYS result before any ptrace entry stop.
-   * On x86, this happens unconditionally for every syscall, but there the
-   * result isn't shared with arg1, and we usually don't care because we have
-   * access to original_syscallno.
-   */
-  if (is_x86ish(t->arch()) || (t->arch() == aarch64 && r.syscallno() == -1)) {
-    r.set_syscall_result(-ENOSYS);
-  }
+  r.emulate_syscall_entry();
   t->set_regs(r);
   t->canonicalize_regs(frame.event().Syscall().arch());
   t->validate_regs();
@@ -726,14 +717,16 @@ Completion ReplaySession::continue_or_step(ReplayTask* t,
                                            TicksRequest tick_request,
                                            ResumeRequest resume_how) {
   if (constraints.command == RUN_SINGLESTEP) {
-    t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT, tick_request);
+    bool ok = t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT_NO_EXIT, tick_request);
+    ASSERT(t, ok) << "Tracee died unexpectedly";
     handle_unrecorded_cpuid_fault(t, constraints);
   } else if (constraints.command == RUN_SINGLESTEP_FAST_FORWARD) {
     fast_forward_status |= fast_forward_through_instruction(
         t, RESUME_SINGLESTEP, constraints.stop_before_states);
     handle_unrecorded_cpuid_fault(t, constraints);
   } else {
-    t->resume_execution(resume_how, RESUME_WAIT, tick_request);
+    bool ok = t->resume_execution(resume_how, RESUME_WAIT_NO_EXIT, tick_request);
+    ASSERT(t, ok) << "Tracee died unexpectedly";
     if (t->stop_sig() == 0) {
       auto type = AddressSpace::rr_page_syscall_from_exit_point(t->arch(), t->ip());
       if (type && type->traced == AddressSpace::UNTRACED) {
@@ -785,17 +778,14 @@ static void guard_overshoot(ReplayTask* t, const Registers& target_regs,
       t->move_ip_before_breakpoint();
     }
     if (closest_matching_regs) {
-      LOG(error)
-          << "Replay diverged; target registers at ticks target mismatched: ";
-      Registers::compare_register_files(t, "rep overshoot", t->regs(), "rec",
-                                        *closest_matching_regs, LOG_MISMATCHES);
+      ASSERT(t, false) << "overshot target ticks=" << target_ticks << " by "
+        << -remaining_ticks << "; target registers at ticks target mismatched: "
+        << "replay != rec: " << t->regs().compare_with(*closest_matching_regs);
     } else {
-      LOG(error) << "Replay diverged; target registers mismatched: ";
-      Registers::compare_register_files(t, "rep overshoot", t->regs(), "rec",
-                                        target_regs, LOG_MISMATCHES);
+      ASSERT(t, false) << "overshot target ticks=" << target_ticks << " by "
+        << -remaining_ticks << "; target registers mismatched: "
+        << "replay != rec: " << t->regs().compare_with(target_regs);
     }
-    ASSERT(t, false) << "overshot target ticks=" << target_ticks << " by "
-                     << -remaining_ticks;
   }
 }
 
@@ -822,15 +812,11 @@ static bool is_same_execution_point(ReplayTask* t, const Registers& rec_regs,
                                     Registers* mismatched_regs,
                                     const Registers** mismatched_regs_ptr,
                                     bool in_syscallbuf) {
-  MismatchBehavior behavior =
-      IS_LOGGING(debug) ? LOG_MISMATCHES : EXPECT_MISMATCHES;
-
   if (ticks_left != 0) {
-    LOG(debug) << "  not same execution point: " << ticks_left
-               << " ticks left (@" << rec_regs.ip() << ")";
     if (IS_LOGGING(debug)) {
-      Registers::compare_register_files(t, "(rep)", t->regs(), "(rec)",
-                                        rec_regs, LOG_MISMATCHES);
+      LOG(debug) << "  not same execution point: " << ticks_left
+                 << " ticks left (@" << rec_regs.ip() << ")"
+                 << " replay vs rec: " << t->regs().compare_with(rec_regs);
     }
     return false;
   }
@@ -847,17 +833,19 @@ static bool is_same_execution_point(ReplayTask* t, const Registers& rec_regs,
       *mismatched_regs_ptr = mismatched_regs;
       return false;
     }
-  } else if (!Registers::compare_register_files(t, "rep", t->regs(), "rec", rec_regs,
-                                                behavior)) {
-    LOG(debug) << "  not same execution point: regs differ (@" << rec_regs.ip()
-               << ")";
+  } else if (!t->regs().matches(rec_regs)) {
+    if (IS_LOGGING(debug)) {
+      LOG(debug) << "  not same execution point: regs differ (@" << rec_regs.ip()
+                 << ") replay vs rec: " << t->regs().compare_with(rec_regs);
+    }
     *mismatched_regs = t->regs();
     *mismatched_regs_ptr = mismatched_regs;
     return false;
-  } else if (!ExtraRegisters::compare_register_files(t, "rep", t->extra_regs(), "rec",
-                                                     rec_extra_regs, behavior)) {
-    LOG(debug) << "  not same execution point: extra regs differ (@" << rec_regs.ip()
-               << ")";
+  } else if (!t->extra_regs().matches(rec_extra_regs)) {
+    if (IS_LOGGING(debug)) {
+      LOG(debug) << "  not same execution point: extra regs differ (@" << rec_regs.ip()
+                 << ") replay vs rec: " << t->extra_regs().compare_with(rec_extra_regs);
+    }
     return false;
   }
   LOG(debug) << "  same execution point";
@@ -1670,7 +1658,8 @@ static void end_task(ReplayTask* t) {
   r.set_syscallno(syscall_number_for_exit(t->arch()));
   t->set_regs(r);
   // Enter the syscall.
-  t->resume_execution(RESUME_CONT, RESUME_WAIT, RESUME_NO_TICKS);
+  bool ok = t->resume_execution(RESUME_CONT, RESUME_WAIT, RESUME_NO_TICKS);
+  ASSERT(t, ok) << "Tracee died unexpectedly";
   if (t->session().done_initial_exec()) {
     ASSERT(t, t->ptrace_event() == PTRACE_EVENT_EXIT);
     t->did_handle_ptrace_exit_event();
@@ -2116,7 +2105,9 @@ void ReplaySession::reattach_tasks(ScopedFd new_tracee_socket, ScopedFd new_trac
   // Get stop events for all tasks
   for (auto& entry : task_map) {
     Task* t = entry.second;
-    t->wait();
+    if (!t->wait()) {
+      FATAL() << "Task " << t->tid << " killed unexpectedly";
+    }
     if (SIGSTOP != t->status().group_stop()) {
       WaitStatus failed_status = t->status();
       FATAL() << "Unexpected stop " << failed_status << " for " << t->tid;

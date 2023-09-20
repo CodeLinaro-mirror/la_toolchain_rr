@@ -3355,7 +3355,10 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
   }
 
   while (true) {
-    t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
+    if (!t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS)) {
+      // Tracee died unexpectedly during clone.
+      return ALLOW_SWITCH;
+    }
     // XXX handle stray signals?
     if (t->ptrace_event()) {
       break;
@@ -3366,7 +3369,7 @@ static Switchable prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) 
       LOG(debug) << "clone failed, returning "
                  << errno_name(-t->regs().syscall_result_signed());
       syscall_state.emulate_result(t->regs().syscall_result());
-      // clone failed and we're existing the syscall with an error. Reenter
+      // clone failed and we're exiting the syscall with an error. Reenter
       // the syscall so that we're in the same state as the normal execution
       // path.
       t->ev().Syscall().failed_during_preparation = true;
@@ -3592,6 +3595,9 @@ static pid_t do_detach_teleport(RecordTask *t)
   // on Alder Lake).
   cpu_set_t mask = t->session().original_affinity();
   syscall(SYS_sched_setaffinity, new_t->tid, sizeof(mask), &mask);
+  // Task::spawn my lave the task in a group-stop if the task SIGSTOPs itself
+  // before we can PTRACE_SEIZE it. Kick it out of that group-stop now.
+  ::kill(new_tid, SIGCONT);
   new_t->detach();
   new_t->did_kill();
   delete new_t;
@@ -6398,7 +6404,7 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::fork:
     case Arch::clone:
       if ((syscallno == Arch::vfork ||
-           (syscallno == Arch::clone && (t->regs().arg1() & CLONE_VFORK))) &&
+           (syscallno == Arch::clone && (t->regs().orig_arg1() & CLONE_VFORK))) &&
           (t->emulated_ptrace_options & PTRACE_O_TRACEVFORKDONE)) {
         t->emulate_ptrace_stop(
             WaitStatus::for_ptrace_event(PTRACE_EVENT_VFORK_DONE));
